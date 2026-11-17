@@ -9,3 +9,4 @@
 *.rknn -text
 *.png -text
 *.cmd text eol=crlf
+*.bin filter=lfs diff=lfs merge=lfs -text

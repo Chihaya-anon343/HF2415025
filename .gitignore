@@ -9,6 +9,7 @@ __pycache__/
 # Raw experiment inputs stay local; retain the target template resources.
 /data/*
 !/data/clean_target2.png
-!/data/NewMuBan(reordered)/
+!/data/NewMuBan(reordered)
+!/data/试飞组3_分段0_通道1_四传感器对齐数据_20261030_093718/
 /cmake-build-*/
 /.idea/
