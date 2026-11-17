@@ -1,0 +1,167 @@
+#pragma once
+
+/**
+ * @file TinyTargetExtractor.hpp
+ * @brief 微小矩形目标（≤800 px 面积）的特征提取器。
+ *
+ * 使用超分辨率 + 最小外接矩形 + 亚像素角点优化。
+ * 当 ROI 面积 ≤ 800 px 时被选中。
+ *
+ * 流水线 (2026-09: 二值图处理升级为 BC 品质清理链，超分空间统一):
+ *   1. 超分辨率（×scale_factor）+ GaussianBlur → Otsu 二值化
+ *   2. BC 清理链：最大连通域 → 填洞 → CLOSE→OPEN（同核 3×3）
+ *   3. 清理后二值图 → 模板 IoU 匹配 → 最佳角度（与角点提取共用同一张图）
+ *   4. 最小外接矩形 → 4个角点 → 亚像素优化
+ *   5. 角度对齐 → 缩放还原 → 4个有序角点
+ *
+ * 从 legacy/TinyTargetPose.cpp 迁移（原始 Python 移植）。
+ */
+
+#include "feature/FeatureExtractor.hpp"
+#include "common/Types.hpp"
+#include "feature/TinyTargetRobustness.hpp"
+
+#include <opencv2/core.hpp>
+
+#include <string>
+#include <memory>
+#include <array>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace gpnp {
+
+inline int readTinyTargetUpscaleMaxRoiArea(const cv::FileNode& node) {
+    if (node.empty()) return 0;
+    if (!node.isInt() || static_cast<int>(node) < 0)
+        throw std::invalid_argument("tiny_target.upscale_max_roi_area must be a non-negative integer");
+    return static_cast<int>(node);
+}
+
+class TinyTargetExtractor : public FeatureExtractor {
+public:
+    struct Config {
+        cv::Size target_size{50, 50};         ///< 模板匹配归一化尺寸
+        int scale_factor = 4;                 ///< 放大因子（1~8）
+        int upscale_max_roi_area = 0;         ///< ROI 面积超过此值时使用1倍；0保持原放大行为
+        double square_size_m_class0 = 0.20;   ///< class0 目标物理边长（米）
+        double square_size_m_class1 = 0.04;   ///< class1 目标物理边长（米，0 则回退 class0）
+        int roi_pad_pixels = 0;               ///< ROI 四周扩展像素数
+        TemplateGeometryConfig template_geometry;
+        std::shared_ptr<const TargetModel> target_model;
+        TinyTargetRobustnessConfig robustness;
+    };
+
+    /// 使用配置和模板目录构造。
+    /// 模板通过 PoseUtils 从 NewMuBan 目录加载。
+    TinyTargetExtractor(const Config& config, const std::string& template_dir);
+
+    ~TinyTargetExtractor() override = default;
+
+    // ---- FeatureExtractor interface ----
+
+    std::string name() const override { return "TinyTarget"; }
+
+    StrategyType strategyType() const override { return StrategyType::TinyTarget; }
+
+    void setTemplateData(const std::string& template_dir,
+                         double real_width_mm,
+                         double real_height_mm) override;
+
+    /// 完整流水线：从左右图像各提取4个角点，填充 PipelineResult
+    /// 用于双目 GPNP（与 BinaryCornerExtractor 模式相同）。
+    PipelineResult extract(const cv::Mat& left_gray,
+                           const cv::Mat& right_gray,
+                           const cv::Mat& left_color,
+                           const cv::Mat& right_color) override;
+
+    PipelineResult extractMono(const cv::Mat& gray,
+                                const cv::Mat& color) override;
+
+    const TemplateData& templateData() const override { return template_data_; }
+
+    void setUseClass1(bool v) override;
+
+    /// 关闭后跳过 last_call_debug_ 调试快照 clone (可视化/单测需要时置 true, 默认 true 保持原行为)
+    void setDebugCapture(bool v) { debug_capture_ = v; }
+
+    // MonoTracker explicitly enables this context. Stereo flow also invokes
+    // extractMono(), so choosing that entry point alone must not enable changes.
+    void setMonoContext(bool v) { mono_context_ = v; }
+    const TinyTargetRobustnessConfig& robustnessConfig() const { return config_.robustness; }
+    const TinyTargetQuality& lastQuality() const { return last_quality_; }
+
+    // ---- Post-extraction state ----
+
+    int lastMatchedAngle() const { return last_best_angle_; }
+    double lastMatchOverlap() const { return last_best_overlap_; }
+
+    /// 返回匹配到的模板（用于可视化），未匹配时返回 nullptr。
+    const TemplateData* lastMatchedTemplate() const {
+        if (last_best_angle_ < 0) return nullptr;
+        for (const auto& t : templates_)
+            if (t.angle == last_best_angle_) return &t;
+        return nullptr;
+    }
+
+    /// 最近一次 extract4Corners 的中间图快照（用于可视化）。
+    struct DebugImages {
+        cv::Mat roi_gray;      ///< 输入 ROI 灰度图
+        cv::Mat otsu_binary;   ///< 超分空间 Otsu 二值图（BC 清理链输入）
+        cv::Mat super_binary;  ///< BC 清理链后的二值图（角度匹配与角点提取共用输入，尺寸 = ROI × sf）
+    };
+    const DebugImages& lastLeftDebug() const { return last_left_debug_; }
+    const DebugImages& lastRightDebug() const { return last_right_debug_; }
+
+private:
+    /// 从单张灰度 ROI 中提取4个角点。
+    /// 返回 ROI 局部坐标中的角点（TL→TR→BR→BL）。
+    Status extract4Corners(const cv::Mat& roi_gray,
+                            std::vector<cv::Point2f>& out_corners,
+                            int& best_angle,
+                            double& best_overlap);
+
+    // Template matching
+    struct TemplateMatchResult {
+        int best_angle = -1;
+        double best_overlap = 0.0;
+    };
+    TemplateMatchResult matchTemplate(const cv::Mat& roi_binary);
+
+    // Sub-pixel corner refinement
+    std::vector<cv::Point2f> refineCorners(const cv::Mat& image,
+                                            const std::vector<cv::Point2f>& corners,
+                                            int win_size);
+    void prepareCanonicalReference();
+    void evaluateDirection(const cv::Mat& cleaned,
+                           const std::vector<cv::Point2f>& initial);
+    std::vector<cv::Point2f> guardedRefine(const cv::Mat& large,
+                                          const std::vector<cv::Point2f>& initial,
+                                          int effective_scale);
+    void resetLastCall();
+    void attachQuality(PipelineResult& result) const;
+
+    Config config_;
+    bool use_class1_ = false;                    ///< 当前使用 class1 尺寸
+    bool debug_capture_ = true;                  ///< last_call_debug_ 调试快照开关
+    bool mono_context_ = false;
+    cv::Mat canonical_reference_;
+    std::array<cv::Mat, 2> target_references_;
+    TinyTargetQuality last_quality_;
+    std::vector<TemplateData> templates_;       ///< 来自 NewMuBan 的角点模板
+    TemplateData template_data_;                 ///< 存储用于 GPNP 的 pts_3d
+
+    /// 基于 square_size_m 一次性初始化 3D 物方点（构造时调用）
+    void initPts3d();
+
+    // 提取后状态
+    int last_best_angle_ = -1;
+    double last_best_overlap_ = 0.0;
+
+    DebugImages last_call_debug_;   ///< extract4Corners 单次调用写入
+    DebugImages last_left_debug_;   ///< 最近一次左图提取快照
+    DebugImages last_right_debug_;  ///< 最近一次右图提取快照
+};
+
+} // namespace gpnp

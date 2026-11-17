@@ -1,0 +1,131 @@
+#include "input/CameraSource.hpp"
+
+#include <chrono>
+#include <iostream>
+#include <thread>
+
+namespace gpnp {
+namespace input {
+
+namespace {
+
+int64_t nowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// open()
+// ============================================================================
+
+bool CameraSource::open(const std::string& uri) {
+    return open(uri, 0.0);
+}
+
+bool CameraSource::open(const std::string& device, double target_fps) {
+    close();
+    target_fps_ = target_fps;
+
+    cap_ = std::make_unique<cv::VideoCapture>();
+
+    // GStreamer 管线串 (含 appsink): Rockchip ISP 等 V4L2 multiplanar 节点
+    // 不被 OpenCV V4L2 后端支持, 必须走 GStreamer 后端
+    const bool is_pipeline = device.find("appsink") != std::string::npos;
+    bool ok = false;
+    if (is_pipeline) {
+        ok = cap_->open(device, cv::CAP_GSTREAMER);
+    } else {
+        // "0" → 摄像头索引; "/dev/video0" 等 → 设备路径
+        int index = -1;
+        try {
+            index = std::stoi(device);
+        } catch (...) {
+            index = -1;
+        }
+        ok = (index >= 0) ? cap_->open(index) : cap_->open(device);
+    }
+    if (!ok) {
+        std::cerr << "[CameraSource] 无法打开摄像头: " << device << std::endl;
+        cap_.reset();
+        return false;
+    }
+
+    // 管线模式下帧率节流由管线自身 (sync/drop) 与 nextFrame() 的 sleep
+    // 限速负责; CAP_PROP_FPS 在 GStreamer 后端无实现
+    if (target_fps_ > 0 && !is_pipeline) {
+        cap_->set(cv::CAP_PROP_FPS, target_fps_);
+    }
+
+    // 等几帧让摄像头完成自动曝光/白平衡 (与 scripts/camera_capture.py 一致)
+    for (int i = 0; i < 5; ++i) {
+        cap_->grab();
+    }
+
+    current_frame_ = 0;
+    std::cout << "[CameraSource] 摄像头已打开: " << device
+              << "  " << cap_->get(cv::CAP_PROP_FRAME_WIDTH) << "x"
+              << cap_->get(cv::CAP_PROP_FRAME_HEIGHT)
+              << "  " << cap_->get(cv::CAP_PROP_FPS) << " fps" << std::endl;
+    return true;
+}
+
+// ============================================================================
+// nextFrame()
+// ============================================================================
+
+bool CameraSource::nextFrame(cv::Mat& left, cv::Mat& right,
+                             int64_t& timestamp_us) {
+    if (!isOpen()) {
+        return false;
+    }
+
+    // 帧率限速: 摄像头帧率高于 target_fps 时 sleep 到目标间隔
+    if (target_fps_ > 0) {
+        const int64_t interval_us = static_cast<int64_t>(1e6 / target_fps_);
+        if (last_frame_us_ > 0) {
+            int64_t elapsed = nowUs() - last_frame_us_;
+            if (elapsed < interval_us) {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(interval_us - elapsed));
+            }
+        }
+    }
+
+    // grab() 阻塞直到硬件下一帧就绪; 返回后立即打戳 — 比 read() 后打戳
+    // 更接近真实曝光时刻 (read 内部还包含解码时间)
+    if (!cap_->grab()) {
+        std::cerr << "[CameraSource] 抓取帧失败" << std::endl;
+        return false;
+    }
+    const int64_t ts = nowUs(); // 主机抓帧返回时刻近似值，并非硬件曝光时间戳
+    cv::Mat frame;
+    if (!cap_->retrieve(frame)) {
+        std::cerr << "[CameraSource] 解码帧失败" << std::endl;
+        return false;
+    }
+
+    left = frame;
+    right = frame.clone();      // 单目源: 右图 = 左图副本
+    timestamp_us = ts;
+    last_frame_us_ = ts;
+    ++current_frame_;
+    return true;
+}
+
+// ============================================================================
+// close()
+// ============================================================================
+
+void CameraSource::close() {
+    if (cap_) {
+        cap_->release();
+        cap_.reset();
+    }
+    current_frame_ = -1;
+}
+
+} // namespace input
+} // namespace gpnp

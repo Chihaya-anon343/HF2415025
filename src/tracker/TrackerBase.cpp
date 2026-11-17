@@ -1,0 +1,656 @@
+/**
+ * @file TrackerBase.cpp
+ * @brief MonoTracker / StereoTracker 共享基础设施。
+ */
+
+#include "tracker/TrackerBase.hpp"
+#include "common/GeometryUtils.hpp"
+#include "common/TemplateGeometry.hpp"
+#include "common/TargetModel.hpp"
+#include "feature/BinaryCornerExtractor.hpp"
+#include "feature/TinyTargetExtractor.hpp"
+
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <map>
+
+namespace gpnp {
+
+// 陈旧 seed 放宽: seed 帧龄超过该值时运动门控阈值 ×kStaleSeedMargin。
+// class1 退化帧不解入缓存时 seed 可连续多帧不刷新，原始门限会把恢复帧的
+// 合理解（Δθ 略超阈值）一并拒掉形成锁死；放宽让恢复解通过。
+constexpr int kStaleSeedAgeFrames = 3;
+constexpr double kStaleSeedMargin = 2.0;
+
+// ============================================================
+// initExtractors
+// ============================================================
+
+void TrackerBase::initExtractors(const std::string& template_path,
+                                  const BinaryCornerExtractor::Config& binary_cfg,
+                                  const std::string& binary_template_dir,
+                                  const TinyTargetExtractor::Config& tiny_cfg,
+                                  const std::string& tiny_template_dir) {
+    // 板模板图直读（Dual-ROI BC 模板派生与可视化的图像来源）
+    template_.gray_image = cv::imread(template_path, cv::IMREAD_GRAYSCALE);
+    if (template_.gray_image.empty()) {
+        std::cerr << "[TrackerBase] WARNING: board template image empty: "
+                  << template_path << "\n";
+    } else {
+        template_.template_width  = template_.gray_image.cols;
+        template_.template_height = template_.gray_image.rows;
+    }
+
+    if (config_.unified_target_model) {
+        target_model_ = buildTargetModel(template_.gray_image, template_path,
+            {config_.dual_roi_class0_points_path,config_.dual_roi_class1_points_path},
+            config_.template_real_width_mm,config_.template_real_height_mm);
+        config_.template_geometry.enabled = true;
+        const auto a=target_model_->classes[0].center_px,b=target_model_->classes[1].center_px;
+        config_.template_geometry.class1_center_in_class0_mm = {
+            (b.x-a.x)*target_model_->mm_per_pixel.x(),(b.y-a.y)*target_model_->mm_per_pixel.y()};
+        std::cout << "[TargetModel] " << target_model_->version << " board="
+                  << target_model_->board_size_mm.transpose() << "mm frame=class0-white-bbox\n";
+        for(int cls=0;cls<2;++cls)
+            std::cout << "[TargetModel] class" << cls << " white_extent="
+                      << target_model_->classes[cls].white_size_mm.transpose()
+                      << "mm BC=10 TT=4 source=" << target_model_->annotation_paths[cls] << '\n';
+    }
+    validateTemplateGeometry(config_.template_geometry);
+    auto bc = binary_cfg;
+    auto tt = tiny_cfg;
+    bc.template_geometry = tt.template_geometry = config_.template_geometry;
+    bc.target_model = tt.target_model = target_model_;
+    binary_extractor_ = std::make_unique<BinaryCornerExtractor>(bc, binary_template_dir);
+    tiny_extractor_ = std::make_unique<TinyTargetExtractor>(tt, tiny_template_dir);
+    if (config_.template_geometry.enabled)
+        std::cout << "[TemplateGeometry] frame=class0 center=bbox mm class1_offset="
+                  << config_.template_geometry.class1_center_in_class0_mm.transpose() << '\n';
+
+    tiny_max_area_  = config_.tiny_max_area;
+    tiny_max_area_class1_  = config_.tiny_max_area_class1;
+    binary_roi_pad_ = binary_cfg.roi_pad_pixels;
+    tiny_roi_pad_   = tiny_cfg.roi_pad_pixels;
+
+    extractor_ = binary_extractor_.get();
+    fallback_extractors_.push_back(tiny_extractor_.get());
+
+    if (verbose_console_)
+        std::cout << "[TrackerBase] Pre-initialized 2 extractors: BinaryCorner, TinyTarget"
+                  << "\n";
+}
+
+// ============================================================
+// configureStrategyChain — 面积提名 + 粘滞状态机 (temporal)
+// ============================================================
+
+void TrackerBase::configureStrategyChain(int roi_area, bool is_class1) {
+    const TemporalConfig& tc = config_.temporal;
+
+    // 缓存年龄：每处理帧自增（成功帧由 finalizePose 清零）
+    cache_age_ = state_.has_cache ? cache_age_ + 1 : 0;
+
+    // class1 regime 翻转 → 阈值集合切换，粘滞复位
+    if (tc.enabled && has_prev_c1_ && prev_use_c1_ != is_class1) {
+        resetStickiness();
+        if (verbose_console_)
+            std::cout << "[Temporal] class1 regime flipped, stickiness reset" << "\n";
+    }
+    prev_use_c1_ = is_class1;
+    has_prev_c1_ = true;
+
+    // 面积 EMA：仅用于提名/迟滞（抗 YOLO bbox 抖动）；越级硬切用 raw 面积不吃平滑延迟
+    if (!has_ema_ || tc.area_ema_alpha <= 0.0) {
+        ema_area_ = roi_area;
+        has_ema_ = true;
+    } else {
+        ema_area_ = tc.area_ema_alpha * roi_area + (1.0 - tc.area_ema_alpha) * ema_area_;
+    }
+
+    nominated_band_ = nominateBand(roi_area, is_class1);
+    int band_used = nominated_band_;
+    if (tc.enabled)
+        band_used = resolveLockedStrategy(nominated_band_, is_class1);
+    sticky_hold_ = tc.enabled && (band_used != nominated_band_);
+
+    applyBandChain(band_used, is_class1);
+
+    // 粘滞压低档位时补齐向上的回退链：提名高档若失效仍可向上退化，避免 TT 单点终结
+    if (tc.enabled && band_used < nominated_band_) {
+        auto pushIfAbsent = [&](FeatureExtractor* e) {
+            if (extractor_ == e) return;
+            for (auto* x : fallback_extractors_) if (x == e) return;
+            fallback_extractors_.push_back(e);
+        };
+        if (band_used <= 1 && nominated_band_ >= 2)
+            pushIfAbsent(binary_extractor_.get());
+    }
+
+    if (verbose_console_ && tc.enabled)
+        std::cout << "[Temporal] locked=" << strategyNameFromBand(band_used)
+                  << " nominated=" << strategyNameFromBand(nominated_band_)
+                  << " pending=" << pending_count_ << "/" << tc.hold_frames
+                  << " ema_area=" << static_cast<int>(ema_area_)
+                  << " raw_area=" << roi_area
+                  << " reason=" << sticky_switch_reason_
+                  << (sticky_hold_ ? " [HOLD]" : "") << "\n";
+}
+
+int TrackerBase::effectiveThresholds(bool is_class1) const {
+    int tiny_t = tiny_max_area_;
+    if (is_class1 && tiny_max_area_class1_ > 0) tiny_t = tiny_max_area_class1_;
+    return tiny_t;
+}
+
+int TrackerBase::bandFromStrategyName(const std::string& name) {
+    if (name == "TinyTarget")   return 1;
+    if (name == "BinaryCorner") return 2;
+    return 0;   // DualRoi 等非两档策略
+}
+
+const char* TrackerBase::strategyNameFromBand(int band) {
+    switch (band) {
+        case 2:  return "BinaryCorner";
+        case 1:  return "TinyTarget";
+        default: return "Unknown";
+    }
+}
+
+int TrackerBase::nominateBand(int roi_area, bool is_class1) const {
+    // 单 ROI 链折叠为 BC→TT 两带；
+    // area==0 (无 ROI) 在 process 入口即判帧失败，不会到达此处
+    if (roi_area > effectiveThresholds(is_class1)) return 2;
+    return 1;
+}
+
+void TrackerBase::applyBandChain(int band, bool is_class1) {
+    const int tiny_t = effectiveThresholds(is_class1);
+
+    fallback_extractors_.clear();
+
+    if (band == 2) {
+        extractor_ = binary_extractor_.get();
+        fallback_extractors_.push_back(tiny_extractor_.get());
+        if (verbose_console_)
+            std::cout << "[TrackerBase] Strategy chain: BinaryCorner → TinyTarget"
+                      << " (tiny_thresh=" << tiny_t
+                      << " is_class1=" << is_class1 << ")" << "\n";
+    } else {
+        extractor_ = tiny_extractor_.get();
+        if (verbose_console_)
+            std::cout << "[TrackerBase] Strategy chain: TinyTarget only"
+                      << " (is_class1=" << is_class1 << ")" << "\n";
+    }
+}
+
+int TrackerBase::resolveLockedStrategy(int band_raw, bool is_class1) {
+    const TemporalConfig& tc = config_.temporal;
+
+    if (!has_sticky_state_) {
+        sticky_locked_ = band_raw;
+        sticky_pending_ = 0;
+        pending_count_ = 0;
+        locked_fail_count_ = 0;
+        has_sticky_state_ = true;
+        sticky_switch_reason_ = "init";
+        return sticky_locked_;
+    }
+
+    // 越级硬切：raw 面积跨越两档（如 TT↔BC，快速接近/远离），立即切换
+    if (std::abs(band_raw - sticky_locked_) >= 2) {
+        sticky_locked_ = band_raw;
+        sticky_pending_ = 0;
+        pending_count_ = 0;
+        locked_fail_count_ = 0;
+        sticky_switch_reason_ = "hard_override";
+        return sticky_locked_;
+    }
+
+    // 相邻档提名：用 EMA 面积重新分类（抗 bbox 抖动）
+    int band_ema = nominateBand(static_cast<int>(ema_area_ + 0.5), is_class1);
+    if (band_ema == sticky_locked_) {
+        pending_count_ = 0;
+        return sticky_locked_;
+    }
+
+    // 迟滞余量：必须决定性地进入另一档
+    const double tiny_t = effectiveThresholds(is_class1);
+    bool margin_ok = false;
+    if (band_ema > sticky_locked_) {
+        margin_ok = ema_area_ > tiny_t * tc.hysteresis_up;
+    } else {
+        margin_ok = ema_area_ < tiny_t * tc.hysteresis_down;
+    }
+
+    if (band_ema == sticky_pending_) ++pending_count_;
+    else { sticky_pending_ = band_ema; pending_count_ = 1; }
+
+    if (margin_ok && pending_count_ >= tc.hold_frames) {
+        sticky_locked_ = band_ema;
+        pending_count_ = 0;
+        sticky_switch_reason_ = "debounce";
+    }
+    return sticky_locked_;
+}
+
+void TrackerBase::resetStickiness() {
+    has_sticky_state_ = false;
+    sticky_locked_ = 0;
+    sticky_pending_ = 0;
+    pending_count_ = 0;
+    locked_fail_count_ = 0;
+    sticky_switch_reason_ = "reset";
+}
+
+void TrackerBase::updateStickinessFromWinner(const std::string& winner_name) {
+    const TemporalConfig& tc = config_.temporal;
+    if (!tc.enabled || !has_sticky_state_) return;
+    int wb = bandFromStrategyName(winner_name);
+    if (wb == 0) return;   // DualRoi 等非三策略胜者不参与
+
+    if (wb == sticky_locked_) {
+        locked_fail_count_ = 0;
+        return;
+    }
+    if (wb == nominated_band_) {
+        // 面积说该切、退化链实际切成了且成功 → 立即对齐（下帧不再浪费首提取尝试）
+        sticky_locked_ = wb;
+        pending_count_ = 0;
+        locked_fail_count_ = 0;
+        sticky_switch_reason_ = "realign";
+        return;
+    }
+    if (++locked_fail_count_ >= tc.locked_fail_limit) {
+        sticky_locked_ = wb;
+        pending_count_ = 0;
+        locked_fail_count_ = 0;
+        sticky_switch_reason_ = "realign";
+    }
+}
+
+int TrackerBase::cacheAgeFrames() const {
+    return std::max(cache_age_,
+                    state_.has_cache ? state_.frame_count - state_.cache_frame : 0);
+}
+
+bool TrackerBase::seedActive() const {
+    const TemporalConfig& tc = config_.temporal;
+    if (!tc.enabled || !state_.has_cache) return false;
+    if (tc.max_cache_age_frames > 0 && cacheAgeFrames() > tc.max_cache_age_frames) return false;
+    return true;
+}
+
+bool TrackerBase::motionGatePass(const PoseEstimate& pose, const PoseSeed& seed,
+                                 const FeatureExtractor* ext, bool widened,
+                                 const char* label, bool stale_relax) const {
+    const TemporalConfig& tc = config_.temporal;
+
+    double margin = 1.0;
+    if (widened) margin *= tc.switch_margin;
+    if (ext) {
+        int band = bandFromStrategyName(ext->name());
+        if (band != 0 && band != sticky_locked_)   // 策略切换帧：放宽吸收策略间系统偏差
+            margin *= tc.switch_margin;
+    }
+    if (stale_relax && cacheAgeFrames() > kStaleSeedAgeFrames)
+        margin *= kStaleSeedMargin;
+    const std::string who = label ? label : (ext ? ext->name() : "?");
+
+    if (tc.max_trans_ratio > 0.0) {
+        double t_ref = seed.t.norm();
+        double t_new = pose.t.norm();
+        if (t_ref > 1e-9 && t_new > 1e-9) {
+            double dt = (pose.t - seed.t).norm();
+            double dt_limit = tc.max_trans_ratio * t_ref * margin;
+            bool dt_ok = dt <= dt_limit;
+            // 径向快变判据：|t| 比值在容限内视为合法快速接近/远离（与 Δt 判据并列，任一满足即过）
+            bool scale_ok = false;
+            double scale = (t_new >= t_ref) ? t_new / t_ref : t_ref / t_new;
+            if (tc.max_scale_ratio > 1.0)
+                scale_ok = scale <= tc.max_scale_ratio * margin;
+            if (!dt_ok && !scale_ok) {
+                if (verbose_console_)
+                    std::cout << "[Gate] |Δt|=" << dt << "mm > " << dt_limit
+                              << ", scale=" << scale << " > " << tc.max_scale_ratio * margin
+                              << " (|t_seed|=" << t_ref << "mm, |t_new|=" << t_new
+                              << "mm, margin=" << margin
+                              << ", " << who << ")" << "\n";
+                return false;
+            }
+        }
+    }
+    if (tc.max_rot_deg > 0.0) {
+        double ang = Eigen::AngleAxisd(pose.R * seed.R.transpose()).angle();
+        double limit = tc.max_rot_deg * CV_PI / 180.0 * margin;
+        if (ang > limit) {
+            if (verbose_console_)
+                std::cout << "[Gate] Δθ=" << ang * 180.0 / CV_PI << "° > "
+                          << tc.max_rot_deg * margin << "° (margin=" << margin
+                          << ", " << (ext ? ext->name() : "?") << ")" << "\n";
+            return false;
+        }
+    }
+    return true;
+}
+
+void TrackerBase::fillTemporalMeta(PipelineResult& result) const {
+    result.seed_age = cache_age_;
+    result.sticky_hold = sticky_hold_;
+    result.nominated_strategy = strategyNameFromBand(nominated_band_);
+    result.switch_reason = sticky_switch_reason_;
+}
+
+// ============================================================
+// validateRoi
+// ============================================================
+
+RoiRect TrackerBase::validateRoi(const RoiRect* roi, const cv::Size& img_size,
+                                  const std::string& name) {
+    if (roi == nullptr || !roi->valid()) return RoiRect{};
+    int x = roi->x, y = roi->y, w = roi->width, h = roi->height;
+    if (x < 0 || y < 0 || w <= 0 || h <= 0)
+        throw std::invalid_argument(name + " invalid");
+    if (x + w > img_size.width || y + h > img_size.height)
+        throw std::invalid_argument(name + " out of bounds");
+    return RoiRect{x, y, w, h};
+}
+
+// ============================================================
+// loadImage
+// ============================================================
+
+std::pair<cv::Mat, cv::Mat> TrackerBase::loadImage(const cv::Mat& img, bool need_color) {
+    cv::Mat gray, color;
+    if (img.channels() == 3) {
+        if (need_color) color = img;   // 引用共享 (调用方只读; 可视化处自行 clone)
+        cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = img;
+        if (need_color) cv::cvtColor(img, color, cv::COLOR_GRAY2BGR);
+    }
+    return {color, gray};
+}
+
+// ============================================================
+// finalizePose
+// ============================================================
+
+void TrackerBase::finalizePose(PipelineResult& result, const PoseEstimate& pose, bool final_accepted) {
+    if (config_.template_geometry.enabled && !result.disparity_only)
+        result.model_frame = "class0";
+    result.R = pose.R;
+    result.t = pose.t;
+    result.gpnp_success = pose.success;
+    result.success = pose.success;   // 统一流水线整体成功标志（终端 FAILED / 三维轴绘制依赖此值）
+    result.gpnp_n_pts = pose.num_points;
+    result.pose_source = pose.source;
+    result.stereo_success = pose.source == PoseSource::StereoGpnp;
+
+    if (pose.success) {
+        cv::Mat R_cv(3, 3, CV_64F);
+        for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c)
+            R_cv.at<double>(r, c) = pose.R(r, c);
+        cv::Mat rvec;
+        cv::Rodrigues(R_cv, rvec);
+
+        // 连续姿态输出: rvec(θ∈[0,π]) 在物理旋转越过 ±180° 时三分量同时翻号, 属表示层跳变。
+        // 这里额外输出 (a) 符号连续化四元数 (b) 相对首帧的 unwrapped 累计旋转角。
+        if (!state_.has_cache) {
+            Eigen::AngleAxisd aa0(pose.R);
+            state_.rot_deg_unwrapped = 0.0;
+            state_.axis_acc = aa0.angle() > 1e-9 ? aa0.axis() : Eigen::Vector3d::UnitZ();
+        } else {
+            Eigen::AngleAxisd aa(pose.R * state_.R_prev.transpose());
+            double s = aa.axis().dot(state_.axis_acc) >= 0.0 ? 1.0 : -1.0;
+            state_.rot_deg_unwrapped += s * aa.angle() * 180.0 / CV_PI;
+            if (aa.angle() > 1e-9)
+                state_.axis_acc = (state_.axis_acc + s * aa.axis()).normalized();
+        }
+        Eigen::Quaterniond q(pose.R);
+        if (state_.has_quat_cache && q.dot(state_.q_prev) < 0.0)
+            q.coeffs() *= -1.0;
+        result.quat_w = q.w(); result.quat_x = q.x();
+        result.quat_y = q.y(); result.quat_z = q.z();
+        result.rot_deg_unwrapped = state_.rot_deg_unwrapped;
+
+        if (verbose_console_) {
+            std::cout << "  Pose: rvec=[" << rvec.at<double>(0) << ", "
+                      << rvec.at<double>(1) << ", " << rvec.at<double>(2) << "]"
+                      << "  tvec=[" << pose.t(0) << ", " << pose.t(1) << ", "
+                      << pose.t(2) << "] mm  n_pts=" << pose.num_points
+                      << "  rot_unwrap=" << result.rot_deg_unwrapped << "deg"
+                      << "  q=[" << result.quat_w << ", " << result.quat_x << ", "
+                      << result.quat_y << ", " << result.quat_z << "]" << "\n";
+        }
+        state_.q_prev = q;
+        state_.has_quat_cache = true;
+        // Unified mode already solves every model in class0; no output correction
+        // is needed before caching or drawing axes. Keep the class1 quality gate:
+        // coordinate alignment does not protect against an incorrectly locked target.
+        // Legacy mode retains its original local-frame cache policy.
+        bool accept_into_cache = true;
+        if (!final_accepted && result.is_class1 && state_.has_cache) {
+            PoseSeed c1_seed;
+            c1_seed.R = state_.R_prev;
+            c1_seed.t = state_.t_prev;
+            accept_into_cache = motionGatePass(pose, c1_seed, nullptr, false, "C1-cache");
+            if (!accept_into_cache && verbose_console_)
+                std::cout << "  [Cache] class1 pose rejected by motion gate, keep previous seed"
+                          << "\n";
+        }
+        if (accept_into_cache) {
+            state_.R_prev = pose.R;
+            state_.t_prev = pose.t;
+            state_.has_cache = true;
+            cache_age_ = 0;
+            state_.cache_frame = state_.frame_count;
+        }
+    }
+}
+
+// ============================================================
+// addLogEntry
+// ============================================================
+
+void TrackerBase::addLogEntry(const PipelineResult& result, bool is_first, bool fallback_used) {
+    if(result.visual_observation.evaluated) {
+        const auto& o=result.visual_observation;
+        std::cout << "[VisualObservation] frame=" << o.frame_id << " status=" << o.status
+                  << " candidates=" << o.candidates.size() << " ratio=" << o.error_ratio
+                  << " gap_px=" << o.error_gap_px << " normal_deg=" << o.normal_gap_deg
+                  << " output=" << (config_.visual_output.fusion_mode?"fusion_pending":"standalone") << '\n';
+    }
+    if(!result.continuity_status.empty())
+        std::cout << "[Continuity] frame=" << (current_frame_>0?current_frame_:state_.frame_count)
+                  << " status=" << result.continuity_status << " rotation_deg=" << result.continuity_rotation_deg
+                  << " normal_deg=" << result.continuity_normal_deg << " trans_ratio=" << result.continuity_translation_ratio
+                  << " scale=" << result.continuity_scale_ratio << " age=" << result.continuity_age
+                  << " pending=" << result.continuity_pending << " rejected_candidates=" << result.continuity_rejected_candidates << '\n';
+    double total_time = result.total_time_ms();
+    double disp_median = 0.0;
+    if (!result.disparity.empty()) {
+        std::vector<double> abs_disp;
+        for (double d : result.disparity) abs_disp.push_back(std::abs(d));
+        disp_median = computeMedian(std::move(abs_disp));
+    }
+    LogEntry entry;
+    entry.frame = state_.frame_count;
+    entry.timestamp = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count()) / 1e9;
+    entry.is_first = is_first;
+    entry.fallback_used = fallback_used;
+    entry.n_kp_left = result.n_kp_left;
+    entry.n_matched = static_cast<int>(result.pts_left_good.size());
+    entry.n_projected = static_cast<int>(result.pts_right_projected.size());
+    entry.n_template_match = result.n_template_match;
+    entry.gpnp_success = result.gpnp_success;
+    entry.gpnp_n_pts = result.gpnp_n_pts;
+    entry.disparity_median = disp_median;
+    entry.total_time_ms = total_time;
+    entry.timing = result.timing;
+    entry.extract_ms = result.extract_ms;
+    entry.pnp_ms = result.pnp_ms;
+    entry.strategy_name = result.strategy_name;
+    entry.last_gpnp_monitor=result.last_gpnp_monitor;
+    if(result.last_gpnp_monitor.gpnp_min_pts>0)state_.last_gpnp_monitor=result.last_gpnp_monitor;
+    entry.flow_planar_status=result.flow_planar_status;
+    entry.flow_planar_rejected=result.flow_planar_rejected;
+    entry.flow_planar_ms=result.flow_planar_ms;
+    entry.stereo_method = result.stereo_method;
+    entry.pose_source = result.pose_source;
+    entry.stereo_success = result.stereo_success;
+    entry.disparity_only = result.disparity_only;
+    entry.disparity_success = result.disparity_success;
+    entry.failure_reason = result.failure_reason;
+    entry.flow_coarse_attempts = result.flow_coarse_attempts;
+    entry.stereo_match_ms = result.stereo_match_ms;
+    entry.flow_roi=result.flow_roi;
+    entry.flow_full_fallback=result.flow_full_fallback;
+    entry.flow_pyramid_builds=result.flow_pyramid_builds;
+    entry.dual_c0_pairs=result.dual_c0_pairs;entry.dual_c1_pairs=result.dual_c1_pairs;
+    entry.legacy_frontend_fallback=result.legacy_frontend_fallback;entry.route_detail=result.route_detail;
+    entry.is_class1 = result.is_class1;
+    entry.warm_start_used = result.warm_start_used;
+    entry.gate_status = static_cast<int>(result.gate_status);
+    entry.seed_age = result.seed_age;
+    entry.sticky_hold = result.sticky_hold;
+    entry.nominated_strategy = result.nominated_strategy;
+    entry.switch_reason = result.switch_reason;
+    if (result.gpnp_success || result.success) {
+        entry.t_x = result.t.x(); entry.t_y = result.t.y(); entry.t_z = result.t.z();
+        Eigen::AngleAxisd aa(result.R);
+        Eigen::Vector3d rv = aa.angle() * aa.axis();
+        entry.rvec_x = rv.x(); entry.rvec_y = rv.y(); entry.rvec_z = rv.z();
+        entry.quat_w = result.quat_w; entry.quat_x = result.quat_x;
+        entry.quat_y = result.quat_y; entry.quat_z = result.quat_z;
+        entry.rot_deg_unwrapped = result.rot_deg_unwrapped;
+    }
+    state_.logs.push_back(std::move(entry));
+}
+
+// ============================================================
+// printLogs
+// ============================================================
+
+void TrackerBase::printLogs() const {
+    const auto& logs = state_.logs;
+    if (logs.empty()) {
+        if (verbose_console_) std::cout << "[Log is empty]" << "\n";
+        return;
+    }
+
+    const std::vector<std::string> timing_keys = {"binary_corner", "tiny_target", "initial_pnp", "flow_crop", "flow_pyramid", "flow_coarse", "flow_lk", "flow_check", "gpnp", "tiny_pnp", "dual_roi"};
+    const std::map<std::string, std::string> timing_labels = {
+        {"binary_corner", "BC"}, {"tiny_target", "TT"}, {"initial_pnp", "InitPnP"},
+        {"gpnp", "GPnP"}, {"tiny_pnp", "TinyPnP"}, {"dual_roi", "DualROI"},
+        {"flow_crop", "Crop"}, {"flow_pyramid", "Pyramid"}, {"flow_coarse", "Coarse"}, {"flow_lk", "LK"}, {"flow_check", "Check"}};
+
+    std::vector<std::string> used_keys;
+    for (const auto& k : timing_keys)
+        for (const auto& log : logs)
+            if (auto it = log.timing.find(k); it != log.timing.end() && it->second > 0.0)
+                { used_keys.push_back(k); break; }
+
+    std::vector<size_t> widths = {5, 12, 8, 8, 8, 10, 8, 10, 10, 10};
+    widths.insert(widths.end(), used_keys.size(), 10);
+
+    // 提取/解算两相总耗时列 (有数据才显示)
+    bool show_extract = false, show_pnp = false;
+    for (const auto& log : logs) {
+        if (log.extract_ms > 0.0) show_extract = true;
+        if (log.pnp_ms > 0.0) show_pnp = true;
+    }
+    if (show_extract) widths.push_back(10);
+    if (show_pnp) widths.push_back(10);
+
+    auto print_sep = [&](char c) {
+        std::cout << "+";
+        for (auto w : widths) std::cout << std::string(w, c) << "+";
+        std::cout << "\n";
+    };
+    auto print_row = [&](const std::vector<std::string>& cols) {
+        std::cout << "|";
+        for (size_t i = 0; i < cols.size() && i < widths.size(); ++i)
+            std::cout << std::setw(static_cast<int>(widths[i])) << cols[i] << "|";
+        std::cout << "\n";
+    };
+
+    print_sep('-');
+    std::vector<std::string> header = {"Fr#", "Timestamp", "1st", "FB", "nKp", "nMatch",
+                                        "nProj", "nTmpl", "Disp(px)", "RotU(deg)", "PnP"};
+    for (const auto& k : used_keys) {
+        auto it = timing_labels.find(k);
+        header.push_back(it != timing_labels.end() ? it->second : k);
+    }
+    if (show_extract) header.push_back("Extract");
+    if (show_pnp) header.push_back("Solve");
+    print_row(header);
+    print_sep('-');
+
+    for (const auto& log : logs) {
+        std::vector<std::string> row;
+        row.push_back(std::to_string(log.frame));
+        std::ostringstream ts; ts << std::fixed << std::setprecision(3) << log.timestamp;
+        row.push_back(ts.str());
+        row.push_back(log.is_first ? "Y" : "N");
+        row.push_back(log.fallback_used ? "Y" : "N");
+        row.push_back(std::to_string(log.n_kp_left));
+        row.push_back(std::to_string(log.n_matched));
+        row.push_back(std::to_string(log.n_projected));
+        row.push_back(std::to_string(log.n_template_match));
+        row.push_back(std::to_string(static_cast<int>(log.disparity_median)));
+        {
+            std::ostringstream ru;
+            ru << std::fixed << std::setprecision(1) << log.rot_deg_unwrapped;
+            row.push_back(ru.str());
+        }
+        row.push_back(log.disparity_only ? "SKIP" : log.gpnp_success ? "OK" : "FAIL");
+        for (const auto& k : used_keys) {
+            auto it = log.timing.find(k);
+            row.push_back(it != log.timing.end() ? std::to_string(static_cast<int>(it->second)) + "ms" : "-");
+        }
+        if (show_extract)
+            row.push_back(std::to_string(static_cast<int>(log.extract_ms)) + "ms");
+        if (show_pnp)
+            row.push_back(std::to_string(static_cast<int>(log.pnp_ms)) + "ms");
+        print_row(row);
+    }
+    print_sep('=');
+    for (const auto& log : logs) {
+        if (log.stereo_method != "LK" && log.stereo_method != "DualBC") continue;
+        std::cout << "[StereoFrontend] frame=" << log.frame << " method=" << log.stereo_method << " source="
+                  << poseSourceName(log.pose_source) << " stereo=" << log.stereo_success
+                  << " pairs=" << log.n_matched << " match_ms=" << log.stereo_match_ms
+                  << " coarse=" << log.flow_coarse_attempts;
+        std::cout << " planar=" << log.flow_planar_status << " planar_rejected=" << log.flow_planar_rejected
+                  << " planar_ms=" << log.flow_planar_ms;
+        if (log.disparity_only) std::cout << " disparity_only=1 match_ok=" << log.disparity_success << " pnp=SKIP";
+        if (log.flow_roi.area()>0) std::cout << " roi=" << log.flow_roi.width << 'x' << log.flow_roi.height
+                                          << " full_retry=" << log.flow_full_fallback;
+        if (!log.failure_reason.empty()) std::cout << " reason=" << log.failure_reason;
+        if (!log.route_detail.empty()) std::cout << " c0=" << log.dual_c0_pairs << " c1=" << log.dual_c1_pairs
+            << " pyramids=" << log.flow_pyramid_builds << " legacy=" << log.legacy_frontend_fallback
+            << " route=" << log.route_detail;
+        std::cout << "\n";
+        const auto& m=log.last_gpnp_monitor;
+        if(m.gpnp_min_pts>0)std::cout<<"[GPnPOptimizer] frame="<<log.frame<<" stop="<<m.opt_message
+            <<" status="<<m.opt_status<<" nfev="<<m.opt_nfev<<" init="<<m.initial_source
+            <<" candidate="<<m.candidate_valid<<" solver_accepted="<<m.pose_accepted
+            <<" frame_accepted="<<log.gpnp_success<<" source="<<poseSourceName(log.pose_source)
+            <<" geometry="<<m.geometry_reason<<" initial_cost="<<m.opt_initial_cost<<" final_cost="<<m.opt_final_cost
+            <<" mean_left="<<m.mean_left_px<<" mean_right="<<m.mean_right_px<<" max_px="<<m.max_reprojection_px
+            <<" reason="<<m.failure_reason<<'\n';
+    }
+}
+
+} // namespace gpnp

@@ -1,0 +1,86 @@
+#pragma once
+
+/**
+ * @file FeatureExtractor.hpp
+ * @brief 特征提取的抽象策略接口。
+ *
+ * 策略：
+ *   - BinaryCornerExtractor (面积 > tiny_max_area)：轮廓角点检测
+ *   - TinyTargetExtractor   (≤ tiny_max_area)：      超分辨率 minAreaRect
+ */
+
+#include "common/Types.hpp"
+
+#include <opencv2/core.hpp>
+
+#include <memory>
+#include <string>
+
+namespace gpnp {
+
+/// 退化链条分发的策略类型。
+enum class StrategyType {
+    BinaryCorner,   ///< Otsu 二值轮廓角点提取 + GPNP
+    TinyTarget      ///< 超分辨率 minAreaRect 四点提取 + solvePnP
+};
+
+/// 特征提取策略的抽象接口。
+///
+/// 每种策略实现特征提取 + 模板匹配，
+/// 生成可供下游流水线（GPNP 位姿估计）使用的 PipelineResult。
+class FeatureExtractor {
+public:
+    virtual ~FeatureExtractor() = default;
+
+    /// 供日志使用的可读策略名称。
+    virtual std::string name() const = 0;
+
+    /// PnP 分发和退化链条排序所需的策略类型。
+    virtual StrategyType strategyType() const = 0;
+
+    /// 接受并加载模板数据（构造后调用一次）。
+    ///
+    /// 对于 BinaryCorner/TinyTarget 策略，从目录加载 PNG+TXT 角点模板。
+    ///
+    /// @param template_dir     模板目录的路径
+    /// @param real_width_mm    模板实际宽度（mm）
+    /// @param real_height_mm   模板实际高度（mm）
+    virtual void setTemplateData(const std::string& template_dir,
+                                  double real_width_mm,
+                                  double real_height_mm) = 0;
+
+    /// 从双目 ROI 图像对中提取特征。
+    ///
+    /// @param left_gray    左相机灰度 ROI
+    /// @param right_gray   右相机灰度 ROI
+    /// @param left_color   左相机彩色 ROI（用于可视化）
+    /// @param right_color  右相机彩色 ROI（用于可视化）
+    /// @return             包含提取特征数据的 PipelineResult
+    virtual PipelineResult extract(const cv::Mat& left_gray,
+                                    const cv::Mat& right_gray,
+                                    const cv::Mat& left_color,
+                                    const cv::Mat& right_color) = 0;
+
+    /// 仅从单张图像 ROI 中提取特征（单目模式）。
+    ///
+    /// 默认实现回退到双目 extract()，传入空的右图。
+    /// 各策略可覆盖实现以针对单目场景做专门处理（如跳过光流/立体投影等双图逻辑）。
+    ///
+    /// @param gray   单张灰度 ROI（左图）
+    /// @param color  单张彩色 ROI（左图，用于可视化）
+    /// @return       包含提取特征数据的 PipelineResult（右图相关字段为空）
+    virtual PipelineResult extractMono(const cv::Mat& gray,
+                                        const cv::Mat& color) {
+        cv::Mat empty;
+        return extract(gray, empty, color, empty);
+    }
+
+    /// 返回此策略使用的模板数据。
+    virtual const TemplateData& templateData() const = 0;
+
+    /// 切换 class0 / class1 的 3D 物理尺寸（仅 BC/TT 需要）。
+    /// 默认空实现。
+    virtual void setUseClass1(bool /*v*/) {}
+};
+
+} // namespace gpnp

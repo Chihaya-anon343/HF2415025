@@ -1,0 +1,187 @@
+/**
+ * @file YoloRoiProvider.cpp
+ * @brief 外观模式实现：YOLO 检测 → 立体 ROI 对。
+ */
+
+#include "detection/YoloRoiProvider.hpp"
+#include "detection/RknnDetector.hpp"
+#include "detection/YoloDetector.hpp"
+#include "common/LogConfig.hpp"
+
+#include <future>
+#include <iostream>
+
+namespace gpnp {
+
+YoloRoiProvider::YoloRoiProvider() = default;
+YoloRoiProvider::~YoloRoiProvider() = default;
+
+bool YoloRoiProvider::initialize(const YoloConfig& yolo_cfg,
+                                  const RoiGenerator::Config& roi_cfg) {
+    try {
+        const std::string& path = yolo_cfg.model_path;
+        const bool is_rknn = path.size() >= 5 &&
+            path.compare(path.size() - 5, 5, ".rknn") == 0;
+        if (is_rknn) {
+            std::cerr << "[YoloRoiProvider] Backend: RKNN NPU" << std::endl;
+            detector_ = std::make_unique<RknnDetector>(yolo_cfg);
+        } else {
+            std::cerr << "[YoloRoiProvider] Backend: ONNX Runtime" << std::endl;
+            detector_ = std::make_unique<YoloDetector>(yolo_cfg);
+        }
+        roi_gen_  = std::make_unique<RoiGenerator>(roi_cfg);
+        if (g_verbose_console)
+            std::cout << "[YoloRoiProvider] Ready. Model: " << yolo_cfg.model_path
+                      << ", conf=" << yolo_cfg.conf_threshold
+                      << ", class=" << yolo_cfg.target_class_id
+                      << ", expand=" << roi_cfg.roi_expand_ratio
+                      << std::endl;
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[YoloRoiProvider] Init failed: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+void YoloRoiProvider::setCloseRangeConfig(const RoiGenerator::CloseRangeConfig& cfg) {
+    if (roi_gen_) roi_gen_->setCloseRangeConfig(cfg);
+}
+
+bool YoloRoiProvider::isReady() const {
+    return detector_ != nullptr && roi_gen_ != nullptr;
+}
+
+std::pair<RoiGroup, RoiGroup> YoloRoiProvider::detect(const cv::Mat& left_img,
+                                                       const cv::Mat& right_img) {
+    if (!isReady()) return {};
+
+    std::vector<Detection> det_left, det_right;
+    Status sl = Status::UnknownError;
+    Status sr = Status::UnknownError;
+
+    // H1: 左右推理并行 — ONNX 后端 YoloDetector::detect() 线程安全
+    // (Ort::Session::Run 支持并发); RKNN 后端内部互斥锁把两路串行化
+    // (rknn_run 非线程安全), 结构不变仅退化为顺序执行
+    try {
+        ++inference_counts_.left;
+        ++inference_counts_.right;
+        auto fut_right = std::async(std::launch::async,
+                                    [&]() { return detector_->detect(right_img, det_right); });
+        sl = detector_->detect(left_img, det_left);
+        sr = fut_right.get();
+    } catch (const std::exception&) {
+        // 极端情况 (如线程创建失败) → 回退串行, 行为与修改前一致
+        det_left.clear();
+        det_right.clear();
+        ++inference_counts_.left;
+        ++inference_counts_.right;
+        sl = detector_->detect(left_img, det_left);
+        sr = detector_->detect(right_img, det_right);
+    }
+
+    // 双侧都有检测 → 生成立体配对；仅一侧检测 → 各自独立生成，另一侧返回 invalid
+    RoiGroup lg, rg;
+    bool left_ok  = (sl == Status::Success && !det_left.empty());
+    bool right_ok = (sr == Status::Success && !det_right.empty());
+
+    if (left_ok && right_ok) {
+        auto [lg_pair, rg_pair] = roi_gen_->generateStereoGroup(
+            det_left, det_right, left_img.size(), right_img.size());
+        lg = lg_pair;
+        rg = rg_pair;
+    } else if (left_ok) {
+        lg = roi_gen_->generateGroup(det_left, left_img.size());
+    } else if (right_ok) {
+        rg = roi_gen_->generateGroup(det_right, right_img.size());
+    }
+
+    if (g_verbose_console) {
+        if (lg.valid() && rg.valid()) {
+            std::cout << "[YoloRoiProvider] ROI=(" << lg.primary.x << "," << lg.primary.y << ","
+                      << lg.primary.width << "," << lg.primary.height << ")";
+            if (lg.is_dual) {
+                std::cout << " + secondary=(" << lg.secondary.x << "," << lg.secondary.y << ","
+                          << lg.secondary.width << "," << lg.secondary.height << ")";
+            }
+            std::cout << std::endl;
+        } else if (lg.valid()) {
+            std::cout << "[YoloRoiProvider] Left-only ROI=(" << lg.primary.x << ","
+                      << lg.primary.y << "," << lg.primary.width << "," << lg.primary.height << ")"
+                      << std::endl;
+        } else if (rg.valid()) {
+            std::cout << "[YoloRoiProvider] Right-only ROI=(" << rg.primary.x << ","
+                      << rg.primary.y << "," << rg.primary.width << "," << rg.primary.height << ")"
+                      << std::endl;
+        }
+    }
+
+    return {lg, rg};
+}
+
+std::vector<RoiCandidate>
+YoloRoiProvider::detectMonoCandidates(const cv::Mat &image) {
+  if (!isReady())
+    return {};
+  std::vector<Detection> detections;
+  ++inference_counts_.left;
+  if (detector_->detect(image, detections) != Status::Success)
+    return {};
+  return roi_gen_->candidates(detections, image.size());
+}
+
+RoiGroup YoloRoiProvider::detectMono(const cv::Mat& left_img) {
+    if (!isReady()) return {};
+
+    std::vector<Detection> det_left;
+    ++inference_counts_.left;
+    Status sl = detector_->detect(left_img, det_left);
+
+    if (sl != Status::Success || det_left.empty()) {
+        return {};
+    }
+
+    // 单目模式：仅对左图生成 RoiGroup，右图为空
+    RoiGroup lg = roi_gen_->generateGroup(det_left, left_img.size());
+
+    if (lg.valid()) {
+        if (g_verbose_console) {
+            std::cout << "[YoloRoiProvider] Mono ROI=("
+                      << lg.primary.x << "," << lg.primary.y << ","
+                      << lg.primary.width << "," << lg.primary.height << ")";
+            if (lg.is_dual) {
+                std::cout << " + secondary=(" << lg.secondary.x << "," << lg.secondary.y << ","
+                          << lg.secondary.width << "," << lg.secondary.height << ")";
+            }
+            std::cout << std::endl;
+        }
+    }
+
+    return lg;
+}
+
+LeftDetection YoloRoiProvider::detectLeft(const cv::Mat& left_img) {
+    LeftDetection left;
+    left.image_size = left_img.size();
+    if (!isReady()) return left;
+    ++inference_counts_.left;
+    left.status = detector_->detect(left_img, left.detections);
+    if (left.status == Status::Success && !left.detections.empty())
+        left.group = roi_gen_->generateGroup(left.detections, left.image_size);
+    return left;
+}
+
+std::pair<RoiGroup, RoiGroup> YoloRoiProvider::completeStereo(const LeftDetection& left,
+                                                            const cv::Mat& right_img) {
+    if (!isReady()) return {};
+    std::vector<Detection> right;
+    ++inference_counts_.right;
+    const Status status = detector_->detect(right_img, right);
+    const bool left_ok = left.status == Status::Success && !left.detections.empty();
+    const bool right_ok = status == Status::Success && !right.empty();
+    if (left_ok && right_ok)
+        return roi_gen_->generateStereoGroup(left.detections, right, left.image_size, right_img.size());
+    return {left_ok ? left.group : RoiGroup{},
+            right_ok ? roi_gen_->generateGroup(right, right_img.size()) : RoiGroup{}};
+}
+
+} // namespace gpnp

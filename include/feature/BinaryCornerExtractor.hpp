@@ -1,0 +1,246 @@
+#pragma once
+
+/**
+ * @file BinaryCornerExtractor.hpp
+ * @brief 通过二值轮廓分析 + approxPolyDP 角点检测进行特征提取。
+ *
+ * 在 ROI 面积介于 801 到 40000 像素之间时被选中。
+ *
+ * 流水线：
+ *   1. Otsu 二值化（内部——调用方提供灰度 ROI）
+ *   2. 保留最大连通分量
+ *   3. 填充空洞
+ *   4. 形态学平滑（闭运算 → 开运算）
+ *   5. 模板匹配（基于 IoU，24 个模板 0°~345°）
+ *   6. 旋转回正（旋转 Otsu 二值图 + 1px 隔离带 + 框外白填充，再选域）
+ *   7. 提取最大轮廓
+ *   8. approxPolyDP 二分搜索 → N 个角点
+ *   9. 将角点旋转回原坐标系（如果曾旋转）
+ *  10. 按模板几何排序角点
+ *
+ * 从 legacy/BinaryCorner.cpp 迁移而来（原始 Python 端口）。
+ * 单目 class0 可通过 mono_identity.frontend="normalized" 使用独立入口：
+ * 清理前景 → 正方形粗归一化/四方向 → 标准空间轮廓十点 → 循环距离匹配
+ * → 可选原始轮廓边线交点精化 → H/完整形状校验；不调用上述24方向步骤。
+ */
+
+#include "feature/FeatureExtractor.hpp"
+#include "common/Types.hpp"
+#include "matching/MonoCornerIdentity.hpp"
+#include "feature/Class1CornerRecovery.hpp"
+
+#include <opencv2/core.hpp>
+
+#include <string>
+#include <memory>
+#include <utility>
+#include <vector>
+
+namespace gpnp {
+
+class BinaryCornerExtractor : public FeatureExtractor {
+public:
+    struct Config {
+        int corners = 10;                     ///< 期望的角点数量
+        int kernel_size = 3;                  ///< 形态学核大小（强制为奇数）
+        double scale = 1.0;                   ///< 旧入口轮廓坐标缩放，不增加图像信息
+        cv::Size target_size{100, 100};       ///< 模板匹配归一化尺寸
+        double pixel_to_meter_scale_class0 = 0.0;  ///< class0 比例：1 模板像素 = ? 米
+        double pixel_to_meter_scale_class1 = 0.0;  ///< class1 比例（0 则回退 class0）
+        int roi_pad_pixels = 0;               ///< 在所有方向上扩展 ROI N 个像素
+        TemplateGeometryConfig template_geometry;
+        std::shared_ptr<const TargetModel> target_model;
+        MonoCornerIdentityConfig mono_identity;
+        Class1CornerRecoveryConfig class1_corner_recovery;
+    };
+
+    /// 用配置和模板目录构造。
+    /// 模板通过 PoseUtils 从 NewMuBan 目录加载。
+    BinaryCornerExtractor(const Config& config, const std::string& template_dir);
+
+    ~BinaryCornerExtractor() override = default;
+
+    // ---- FeatureExtractor interface ----
+
+    std::string name() const override { return "BinaryCorner"; }
+
+    StrategyType strategyType() const override { return StrategyType::BinaryCorner; }
+
+    void setTemplateData(const std::string& template_dir,
+                         double real_width_mm,
+                         double real_height_mm) override;
+
+    /// 完整流水线入口点。
+    ///
+    /// 输入：left_gray（CV_8UC1 灰度 ROI），right_gray/color 透传。
+    /// 输出：PipelineResult 包含：
+    ///   - kp_left：提取的角点 KeyPoints
+    ///   - pts_left_match：角点坐标（用于调试/PnP）
+    ///   - pts_template_match：匹配到的模板角点（缩放到 ROI 尺寸）
+    ///   - desc_left、disparity、pts_left_good 等：空（无立体/AKAZE 描述子）
+    PipelineResult extract(const cv::Mat& left_gray,
+                           const cv::Mat& right_gray,
+                           const cv::Mat& left_color,
+                           const cv::Mat& right_color) override;
+
+    PipelineResult extractMono(const cv::Mat& gray,
+                                const cv::Mat& color) override;
+    // Scoped opt-in: shared DualRoi/stereo extractors never inherit this context.
+    PipelineResult extractMonoOrdinary(const cv::Mat& gray, const cv::Mat& color);
+    PipelineResult extractMonoDual(const cv::Mat& gray, const cv::Mat& color,
+                                   const NormalizedCornerRecoveryConfig& policy);
+
+    const TemplateData& templateData() const override { return template_data_; }
+
+    void setUseClass1(bool v) override;
+
+    /// 关闭后跳过 last_*_ 调试快照 clone (可视化/单测需要时置 true, 默认 true 保持原行为)
+    void setDebugCapture(bool v) { debug_capture_ = v; }
+    bool debugCapture() const { return debug_capture_; }
+    // Only MonoTracker enables this context; StereoTracker also calls extractMono
+    // for LK, so method name alone must never activate the new front end.
+    void setMonoContext(bool v) { mono_context_ = v; }
+    void setClass1CornerRecoveryAllowed(bool v) { class1_recovery_allowed_ = v; }
+    /// Dedicated DualROI extractor: annotation row IDs become canonical IDs.
+    /// Does not alter physical scale or the legacy/stereo template cache.
+    void setMonoCanonicalModel(const std::vector<cv::Point2f>& points);
+    const MonoCornerIdentityResult& lastMonoIdentity() const { return last_mono_identity_; }
+
+    // ---- 提取后状态 ----
+
+    const TemplateData* lastMatchedTemplate() const { return last_matched_template_; }
+    double lastMatchOverlap() const { return last_match_overlap_; }
+    const std::vector<cv::Point2f>& lastCornersBeforeReorder() const {
+        return last_corners_before_reorder_;
+    }
+
+    /// 返回最近一次提取的二值图像（用于可视化调试）
+    const cv::Mat& lastLeftBinary()  const { return last_left_binary_; }
+    const cv::Mat& lastRightBinary() const { return last_right_binary_; }
+
+    /// 返回旋转回正后的二值图像（用于可视化调试）
+    const cv::Mat& lastUprightBinary() const { return last_upright_binary_; }
+
+    /// 返回第1步 keepLargestRegion 筛选后的掩码（用于可视化调试）
+    const cv::Mat& lastLargestRegion() const { return last_largest_region_; }
+
+    /// 返回第5步轮廓提取时的二值图（角点提取的直接输入）
+    const cv::Mat& lastContourBinary() const { return last_contour_binary_; }
+    /// 返回第5步提取的最大轮廓（approxPolyDP 的直接输入，cleaned 坐标系）
+    const std::vector<cv::Point>& lastContour() const { return last_contour_; }
+
+    /// 返回最近一次 extract() 的二值化全阶段快照 (label → 图像)。
+    /// 阶段: otsu → largest → filled → smoothed → (rot-otsu → from-center →
+    /// rot-cleaned | rot-binary 回退); 双目时左/右前缀 "L|"/"R|"，单目 "L|"。
+    /// debug_capture_=false 时为空。注意: 每次 extract()/extractMono() 覆盖。
+    const std::vector<std::pair<std::string, cv::Mat>>& lastBinaryProcess() const {
+        return last_binary_process_;
+    }
+
+    // ---- 诊断信息 ----
+
+    const std::vector<std::pair<std::string, std::string>>& processLog() const {
+        return process_log_;
+    }
+
+    // ---- 静态可视化辅助函数 ----
+
+    static cv::Mat drawCorners(const cv::Mat& img,
+                                const std::vector<cv::Point2f>& corners);
+
+    static cv::Mat drawMatchedCorners(
+        const cv::Mat& input_img,
+        const std::vector<cv::Point2f>& input_corners,
+        const cv::Mat& template_img,
+        const std::vector<cv::Point2f>& template_corners,
+        double template_angle = 0.0);
+
+    static std::vector<cv::Mat> debugVisualizeReordering(
+        const cv::Mat& binary_img,
+        const cv::Mat& template_img,
+        const std::vector<cv::Point2f>& binary_corners,
+        const std::vector<cv::Point2f>& template_corners,
+        double template_angle,
+        const cv::Size& coord_size);
+
+    /// 几何角点排序：计算极角，从参考角度开始，逆时针排列。
+    static std::vector<int> reorderByGeometry(
+        const std::vector<cv::Point2f>& corners,
+        const cv::Point2f& center,
+        double reference_angle_deg,
+        double ref_dist = -1.0);
+
+private:
+
+    /// 从二值图像 (0/255) 提取角点的核心函数。
+    /// @param binary_img      Otsu 二值化后的 ROI
+    /// @param out_corners     输出的角点（ROI 局部坐标）
+    /// @param preset_template 可选：预设模板，非空时跳过前置清理链
+    ///                        （其输出仅服务模板匹配）与 findBestMatch() 直接使用
+    Status extractFromBinary(const cv::Mat& binary_img,
+                              std::vector<cv::Point2f>& out_corners,
+                              const TemplateData* preset_template = nullptr);
+
+    cv::Mat keepLargestRegion(const cv::Mat& binary_img);
+    cv::Mat fillHoles(const cv::Mat& binary_img);
+    cv::Mat smoothBoundary(const cv::Mat& binary_img);
+    std::vector<cv::Point> extractLargestContour(const cv::Mat& binary_img);
+    std::vector<cv::Point2f> extractCornersFromContour(
+        const std::vector<cv::Point>& contour, const cv::Size& img_size);
+
+    // 模板匹配
+    struct BestMatch {
+        int template_index = -1;
+        double overlap = 0.0;
+    };
+    BestMatch findBestMatch(const cv::Mat& binary_img);
+    std::vector<std::pair<int, int>> matchCorners(
+        const std::vector<cv::Point2f>& template_corners,
+        const std::vector<cv::Point2f>& binary_corners,
+        double template_angle,
+        const cv::Size& coord_size);
+
+    // 日志记录
+    void logStep(const std::string& step, const std::string& info);
+
+    /// 一次性从 0° 模板 + pixel_to_meter_scale_* 计算 pts_3d
+    void initPts3dFromTemplates();
+
+    // ========================================================================
+    // 状态
+    // ========================================================================
+
+    Config config_;
+    MonoCornerIdentity mono_identity_;
+    MonoCornerIdentityResult last_mono_identity_;
+    cv::Mat mono_identity_mask_;
+    bool mono_context_{false};
+    bool ordinary_recovery_context_{false};
+    const NormalizedCornerRecoveryConfig* dual_recovery_context_{nullptr};
+    bool class1_recovery_allowed_{true};
+    cv::Mat kernel_;
+    bool use_class1_ = false;                    ///< 当前使用 class1 尺寸
+    bool debug_capture_ = true;                  ///< last_*_ 调试快照开关
+    std::vector<TemplateData> templates_;       ///< 来自 NewMuBan 的角点模板
+    TemplateData template_data_;                 ///< 存储用于 PnP 的 pts_3d
+
+    // 提取后状态
+    const TemplateData* last_matched_template_ = nullptr;
+    double last_match_overlap_ = 0.0;
+    std::vector<cv::Point2f> last_corners_before_reorder_;
+    std::vector<std::pair<std::string, std::string>> process_log_;
+
+    // 最近一次提取的二值图像（用于可视化）
+    cv::Mat last_left_binary_;
+    cv::Mat last_right_binary_;
+    cv::Mat last_upright_binary_;    // 旋转回正后的二值图
+    cv::Mat last_largest_region_;    // 第1步最大连通域筛选结果
+    cv::Mat last_contour_binary_;    // 第5步轮廓提取时的二值图（角点输入）
+    std::vector<cv::Point> last_contour_;  // approxPolyDP 的输入轮廓
+
+    // 二值化全阶段快照 (label → 图像), 供 Dual-ROI 可视化拼条图
+    std::vector<std::pair<std::string, cv::Mat>> last_binary_process_;
+    std::string stage_prefix_;       // 双目 "L|"/"R|" 左右目标签前缀
+};
+
+} // namespace gpnp

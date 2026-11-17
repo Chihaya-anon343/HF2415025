@@ -1,0 +1,1408 @@
+#include "feature/BinaryCornerExtractor.hpp"
+#include "common/TemplateGeometry.hpp"
+#include "common/TargetModel.hpp"
+#include "utils/PoseUtils.hpp"
+#include "common/GeometryUtils.hpp"
+#include "common/LogConfig.hpp"
+
+#include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+
+namespace gpnp {
+
+namespace {
+
+constexpr double CPSAGL = 20.0;  // 角点重排序角度容差
+
+} // anonymous namespace
+
+// ============================================================================
+// 构造 —— 加载模板，初始化形态学核
+// ============================================================================
+
+BinaryCornerExtractor::BinaryCornerExtractor(const Config& config,
+                                               const std::string& template_dir)
+    : config_(config), mono_identity_(config.mono_identity)
+{
+    // 强制使用奇数核尺寸
+    if (config_.kernel_size % 2 == 0) {
+        config_.kernel_size += 1;
+    }
+    kernel_ = cv::getStructuringElement(cv::MORPH_RECT,
+                                         cv::Size(config_.kernel_size, config_.kernel_size));
+
+    // 从 NewMuBan 加载角点模板
+    templates_ = config_.target_model ? config_.target_model->classes[0].templates
+                                     : loadTemplates(template_dir, false);
+    if (!templates_.empty()) {
+        if (g_verbose_console)
+            std::cout << "[BinaryCorner] Loaded " << templates_.size()
+                      << " templates from " << template_dir << std::endl;
+    } else {
+        std::cerr << "[BinaryCorner] WARNING: No templates loaded from "
+                  << template_dir << std::endl;
+    }
+
+    // 一次性初始化 3D 模板点（0° 模板 × pixel_to_meter_scale）
+    initPts3dFromTemplates();
+    for(const auto& t:templates_) if(t.angle==0) { mono_identity_.setModel(t.corners);break; }
+}
+
+// ============================================================================
+// initPts3dFromTemplates — 一次性从 0° 模板 + pixel_to_meter_scale 计算 pts_3d
+// ============================================================================
+
+void BinaryCornerExtractor::initPts3dFromTemplates() {
+    if (config_.target_model) {
+        template_data_.pts_3d = config_.target_model->classes[use_class1_ ? 1 : 0].bc_points;
+        return;
+    }
+    double scale = use_class1_ ? config_.pixel_to_meter_scale_class1
+                               : config_.pixel_to_meter_scale_class0;
+    // class1 fallback: 0 → use class0 value
+    if (use_class1_ && scale <= 0.0)
+        scale = config_.pixel_to_meter_scale_class0;
+    if (scale <= 0.0) return;
+
+    // 查找 0° 模板
+    const TemplateData* tmpl_0 = nullptr;
+    for (const auto& t : templates_) {
+        if (t.angle == 0) { tmpl_0 = &t; break; }
+    }
+    if (tmpl_0 == nullptr) return;
+
+    double s_mm_per_px = scale * 1000.0;  // m/px → mm/px
+    const auto& tc = tmpl_0->corners;
+    if (tc.empty()) return;
+    double mx = 0.0, my = 0.0;
+    for (const auto& p : tc) { mx += p.x; my += p.y; }
+    mx = mx / static_cast<double>(tc.size()) * s_mm_per_px;
+    my = my / static_cast<double>(tc.size()) * s_mm_per_px;
+    template_data_.pts_3d.clear();
+    template_data_.pts_3d.reserve(tc.size());
+    for (const auto& p : tc) {
+        template_data_.pts_3d.emplace_back(p.x * s_mm_per_px - mx,
+                                           p.y * s_mm_per_px - my, 0.0);
+    }
+    placeTemplateInClass0(template_data_.pts_3d, use_class1_, config_.template_geometry);
+
+    if (g_verbose_console)
+        std::cout << "[BinaryCorner] 3D pts (mm): " << template_data_.pts_3d.size()
+                  << " (angle=0, scale=" << s_mm_per_px << " mm/px"
+                  << "  use_class1=" << (use_class1_ ? "true" : "false") << ")"
+                  << std::endl;
+}
+
+void BinaryCornerExtractor::setUseClass1(bool v) {
+    if (use_class1_ == v) return;
+    use_class1_ = v;
+    if (config_.target_model) {
+        last_matched_template_ = nullptr;
+        templates_ = config_.target_model->classes[use_class1_ ? 1 : 0].templates;
+        mono_identity_.setModel(templates_.front().corners);
+    }
+    initPts3dFromTemplates();
+}
+
+void BinaryCornerExtractor::setMonoCanonicalModel(const std::vector<cv::Point2f>& points) {
+    if(points.size()!=10 || !std::all_of(points.begin(),points.end(),[](const cv::Point2f& p) {
+        return std::isfinite(p.x)&&std::isfinite(p.y);
+    }) || std::abs(cv::contourArea(points))<1e-3)
+        throw std::invalid_argument("DualROI canonical BC model requires ten finite nondegenerate points");
+    mono_identity_.setModel(points);
+}
+
+// ============================================================================
+// 模板数据加载
+// ============================================================================
+
+void BinaryCornerExtractor::setTemplateData(const std::string& template_dir,
+                                             double /*real_width_mm*/,
+                                             double /*real_height_mm*/) {
+    if (config_.target_model)
+        throw std::invalid_argument("Unified target model is immutable; rebuild tracker to reload resources");
+    templates_ = loadTemplates(template_dir, false);
+    mono_identity_.setModel({});
+    for(const auto& t:templates_) if(t.angle==0) { mono_identity_.setModel(t.corners);break; }
+    if (!templates_.empty()) {
+        if (g_verbose_console)
+            std::cout << "[BinaryCorner] Reloaded " << templates_.size()
+                      << " templates" << std::endl;
+    }
+}
+
+// ============================================================================
+// 主入口 —— FeatureExtractor 接口：灰度ROI → Otsu二值化 → 角点提取 → PipelineResult
+// ============================================================================
+
+PipelineResult BinaryCornerExtractor::extract(const cv::Mat& left_gray,
+                                               const cv::Mat& right_gray,
+                                               const cv::Mat& left_color,
+                                               const cv::Mat& right_color) {
+    PipelineResult result;
+    last_mono_identity_=MonoCornerIdentityResult{};
+    result.left_color = left_color;
+    result.right_color = right_color;
+
+    // ---- 输入校验 ----
+    if (left_gray.empty()) {
+        std::cerr << "[BinaryCorner] extract() called with empty left image." << std::endl;
+        return result;
+    }
+
+    auto t_extract_start = std::chrono::steady_clock::now();
+
+    // 二值化阶段快照: 每次调用覆盖; 左/右目分别打 "L|"/"R|" 前缀
+    last_binary_process_.clear();
+    stage_prefix_ = "L|";
+
+    // ---- 第1步: Otsu 二值化（两幅图像） ----
+    cv::Mat left_binary, right_binary;
+    cv::threshold(left_gray, left_binary, 0, 255, cv::THRESH_BINARY + cv::THRESH_OTSU);
+    if (debug_capture_) last_left_binary_ = left_binary.clone();   // 保存用于可视化
+
+    bool has_right = !right_gray.empty();
+    if (has_right) {
+        cv::threshold(right_gray, right_binary, 0, 255, cv::THRESH_BINARY + cv::THRESH_OTSU);
+        if (debug_capture_) last_right_binary_ = right_binary.clone();
+    }
+
+    if (g_verbose_console) {
+        std::cout << "[BinaryCorner] Left ROI=" << left_gray.cols << "x" << left_gray.rows
+                  << ", white=" << cv::countNonZero(left_binary);
+        if (has_right) {
+            std::cout << " | Right ROI=" << right_gray.cols << "x" << right_gray.rows
+                      << ", white=" << cv::countNonZero(right_binary);
+        }
+        std::cout << std::endl;
+    }
+
+    // ---- 第2步: 从左图提取角点 ----
+    std::vector<cv::Point2f> left_corners;
+    Status s_left = extractFromBinary(left_binary, left_corners);
+    if (s_left != Status::Success || left_corners.empty()) {
+        std::cerr << "[BinaryCorner] Left extraction failed (status="
+                  << static_cast<int>(s_left) << ")" << std::endl;
+        return result;
+    }
+
+    // 保存左图的模板匹配结果（右图提取可能会覆盖）
+    const TemplateData* matched_tmpl = last_matched_template_;
+    double matched_overlap = last_match_overlap_;
+
+    // ---- 第3步: 从右图提取角点（复用左图模板） ----
+    std::vector<cv::Point2f> right_corners;
+    if (has_right) {
+        // 右目复用左目的模板，避免独立 findBestMatch 导致左右匹配不同模板
+        stage_prefix_ = "R|";
+        Status s_right = extractFromBinary(right_binary, right_corners,
+                                           matched_tmpl);
+        if (s_right != Status::Success || right_corners.empty()) {
+            std::cerr << "[BinaryCorner] Right extraction failed (status="
+                      << static_cast<int>(s_right) << "), stereo disabled." << std::endl;
+            right_corners.clear();
+        }
+    }
+
+    // 恢复左图的模板匹配结果（右图的 extractFromBinary 可能会覆盖）
+    last_matched_template_ = matched_tmpl;
+    last_match_overlap_ = matched_overlap;
+
+    // ---- 第4步: 按索引匹配左右角点（1:1 映射，同形状，同顺序） ----
+    int n_stereo = std::min(static_cast<int>(left_corners.size()),
+                             static_cast<int>(right_corners.size()));
+    if (n_stereo > 0 && !has_right) n_stereo = 0;  // no right image → no stereo
+
+    // ---- 第5步: 填充 PipelineResult ----
+
+    // 5a. kp_left: 角点转为 KeyPoints
+    result.kp_left.reserve(left_corners.size());
+    for (const auto& pt : left_corners) {
+        result.kp_left.emplace_back(pt, 1.0f);
+    }
+    result.n_kp_left = static_cast<int>(left_corners.size());
+
+    // 5b. 双目数据: 角点存为 pts_left_good/pts_right_good（ROI 局部坐标）。
+    //     视差在 StereoTracker::process() 中 offsetResultToOriginal 之后计算，
+    //     此时坐标为全图空间（左右 ROI 可能有不同的偏移量）。
+    if (n_stereo > 0) {
+        result.pts_left_good.resize(n_stereo);
+        result.pts_right_good.resize(n_stereo);
+        result.dx_filtered.resize(n_stereo);
+        result.disparity.resize(n_stereo);
+        result.idx_from_filtered.resize(n_stereo);
+
+        for (int i = 0; i < n_stereo; ++i) {
+            result.pts_left_good[i]  = left_corners[i];
+            result.pts_right_good[i] = right_corners[i];
+            // 占位 —— 真实视差在 process() 中偏移后计算
+            result.dx_filtered[i] = 0.0;
+            result.disparity[i] = 0.0;
+            result.idx_from_filtered[i] = i;
+        }
+    }
+
+    // 5c. 模板匹配数据（用于 GPNP: good_matches → queryIdx↔trainIdx 映射）
+    result.pts_left_match = left_corners;
+
+    // 查找 0° 模板（始终以 0° 作为 3D 参考，无论匹配到哪个角度）
+    const TemplateData* tmpl_0 = nullptr;
+    for (const auto& t : templates_) {
+        if (t.angle == 0) {
+            tmpl_0 = &t;
+            break;
+        }
+    }
+    // 若无可用的 0° 模板，回退到匹配到的模板
+    if (tmpl_0 == nullptr) tmpl_0 = matched_tmpl;
+
+    if (tmpl_0 != nullptr) {
+        // 将模板角点缩放到左图 ROI 尺寸
+        double scale_x = static_cast<double>(left_gray.cols)
+                       / tmpl_0->image.cols;
+        double scale_y = static_cast<double>(left_gray.rows)
+                       / tmpl_0->image.rows;
+
+        result.pts_template_match = tmpl_0->corners;
+        for (auto& pt : result.pts_template_match) {
+            pt.x *= static_cast<float>(scale_x);
+            pt.y *= static_cast<float>(scale_y);
+        }
+        result.n_template_match = static_cast<int>(result.pts_template_match.size());
+
+        // 合成 DMatch: queryIdx=i（左图关键点索引）, trainIdx=i（模板角点索引）
+        // GPNP 使用 train_lut[queryIdx]=trainIdx 将双目点映射到 3D 点。
+        // 1:1 对应关系下: train_lut[i] = i。
+        int n_match = std::min(static_cast<int>(left_corners.size()),
+                               static_cast<int>(tmpl_0->corners.size()));
+        result.good_matches.reserve(n_match);
+        for (int i = 0; i < n_match; ++i) {
+            result.good_matches.emplace_back(i, i, 0.0f);  // queryIdx, trainIdx, distance=0
+        }
+    }
+
+    // 3D 物方点已在构造时由 initPts3dFromTemplates() 初始化。
+
+    // desc_left 保持为空（无 AKAZE 描述子）
+    // pts_left_used/pts_right_used/pts_right_projected 保持为空
+    //   （GPNP 直接通过 idx_from_filtered 使用 pts_left_good/pts_right_good）
+
+    result.timing["binary_corner"] = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_extract_start).count();
+
+    if (g_verbose_console)
+        std::cout << "[BinaryCorner] Extracted " << left_corners.size()
+                  << " corners (L), " << right_corners.size() << " corners (R)"
+                  << ", stereo=" << n_stereo
+                  << ", angle=" << (matched_tmpl ? std::to_string(matched_tmpl->angle) : "none")
+                  << ", overlap=" << matched_overlap
+                  << ", template_corners=" << (matched_tmpl ? static_cast<int>(matched_tmpl->corners.size()) : 0)
+              << ", 3d_pts=" << template_data_.pts_3d.size()
+              << std::endl;
+
+    return result;
+}
+
+// ============================================================================
+// 内部流水线 —— 7步二值图像角点提取
+// ============================================================================
+
+Status BinaryCornerExtractor::extractFromBinary(const cv::Mat& binary_img,
+                                                 std::vector<cv::Point2f>& out_corners,
+                                                 const TemplateData* preset_template) {
+    process_log_.clear();
+    last_matched_template_ = nullptr;
+    last_match_overlap_ = 0.0;
+    last_contour_binary_.release();
+    last_contour_.clear();
+
+    if (binary_img.empty()) {
+        logStep("Input", "Empty image");
+        return Status::EmptyInput;
+    }
+
+    logStep("Input",
+            "Size: " + std::to_string(binary_img.cols) + "x" + std::to_string(binary_img.rows));
+
+    // 二值化阶段快照 (label = stage_prefix_ + 阶段名, Dual-ROI 可视化拼条图用)
+    auto snap = [&](const std::string& key, const cv::Mat& mat) {
+        if (debug_capture_ && !mat.empty())
+            last_binary_process_.emplace_back(stage_prefix_ + key, mat.clone());
+    };
+
+    // ---- 预处理：确保单通道二值图像 ----
+    cv::Mat work_img;
+    if (binary_img.channels() == 3) {
+        cv::cvtColor(binary_img, work_img, cv::COLOR_BGR2GRAY);
+    } else if (binary_img.channels() == 1) {
+        work_img = binary_img.clone();
+        if (work_img.type() != CV_8UC1) {
+            work_img.convertTo(work_img, CV_8UC1);
+        }
+    } else {
+        logStep("Preprocess", "Invalid channel count");
+        return Status::InvalidSize;
+    }
+    snap("1.otsu", work_img);
+
+    // ---- 第1~3步: 清理链 (最大连通域 → 填洞 → 平滑) ----
+    // 输出 smoothed 只被第4步 findBestMatch 消费; preset 路径 (右目复用左目
+    // 模板) 跳过模板匹配, 整链无消费者 → 直接跳过 (右目省 3 次全图操作
+    // + connectedComponents + findContours, 角点/位姿结果逐位不变)
+    cv::Mat smoothed;
+    if (preset_template == nullptr) {
+        cv::Mat largest_region = keepLargestRegion(work_img);
+        if (debug_capture_) last_largest_region_ = largest_region.clone();
+        snap("2.largest", largest_region);
+
+        cv::Mat filled = fillHoles(largest_region);
+        snap("3.filled", filled);
+
+        smoothed = smoothBoundary(filled);
+        snap("4.smoothed", smoothed);
+    } else {
+        logStep("CleanupChain", "Skipped (preset template path)");
+    }
+
+    // ---- 第4步: 模板匹配 ----
+    if (preset_template != nullptr) {
+        // 使用预设模板（来自另一目的匹配结果），跳过独立的 findBestMatch
+        last_matched_template_ = preset_template;
+        last_match_overlap_ = -1.0;  // 标记为非独立匹配
+        logStep("FindBestMatch",
+                "Preset: angle=" + std::to_string(preset_template->angle) +
+                " deg (reused from other eye)");
+    } else if (!templates_.empty() && config_.target_size.width > 0) {
+        cv::Mat resized_binary;
+        cv::resize(smoothed, resized_binary, config_.target_size, 0, 0, cv::INTER_NEAREST);
+
+        BestMatch best = findBestMatch(resized_binary);
+
+        if (best.template_index >= 0) {
+            last_match_overlap_ = best.overlap;
+            last_matched_template_ = &templates_[best.template_index];
+        }
+    }
+
+    // ---- Step 4.5: 旋转回正 (Otsu 前置 + 二值空间白填充) ----
+    // 旋转 L1 的原始 Otsu 二值图 (与 L2 选域同源同阈值), 旋转框外填充白色。
+    // 填充不参与任何 Otsu 直方图, 不再发生灰度填充污染阈值导致的选域翻转。
+    // 填充必须与图内内容隔离: 紧框下 ROI 边界处是白色靶板像素, 若与白色填充
+    // 直接相邻则粘连成一个高贴边覆盖的巨型边界域, 靶板随填充一起被剔除
+    // (class1 误锁复发)。故先加 1px 黑色隔离带再旋转填充; 填充域全程贴满
+    // 画幅边界, 被 keepLargestRegion 的高覆盖守卫稳定剔除。
+    cv::Mat cleaned;
+    cv::Point2f center_orig, center_rot;
+    double rot_angle = 0.0;
+    bool did_rotate = false;
+
+    if (last_matched_template_ != nullptr) {
+        rot_angle = static_cast<double>(last_matched_template_->angle);
+
+        cv::Mat padded;
+        cv::copyMakeBorder(work_img, padded, 1, 1, 1, 1, cv::BORDER_CONSTANT, cv::Scalar(0));
+
+        int h = padded.rows, w = padded.cols;
+        double rad = std::abs(rot_angle) * CV_PI / 180.0;
+        double cos_a = std::abs(std::cos(rad));
+        double sin_a = std::abs(std::sin(rad));
+        int new_w = static_cast<int>(h * sin_a + w * cos_a);
+        int new_h = static_cast<int>(h * cos_a + w * sin_a);
+
+        // center_orig 取原始图中心 (padded 中心 - 1px pad): 第6.5步逆旋转
+        // 公式无需感知 pad, 角点直接落回原始 ROI 坐标
+        center_orig = cv::Point2f((w - 2) / 2.0f, (h - 2) / 2.0f);
+        cv::Mat M = cv::getRotationMatrix2D(cv::Point2f(w / 2.0f, h / 2.0f), -rot_angle, 1.0);
+        M.at<double>(0, 2) += (new_w - w) / 2.0;
+        M.at<double>(1, 2) += (new_h - h) / 2.0;
+        center_rot = cv::Point2f(new_w / 2.0f, new_h / 2.0f);
+
+        cv::Mat bin_rotated;
+        cv::warpAffine(padded, bin_rotated, M, cv::Size(new_w, new_h),
+                       cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(255));
+        snap("5.rot-binary-fill255(" + std::to_string(static_cast<int>(rot_angle)) + "deg)",
+             bin_rotated);
+
+        // 选域: keepLargestRegion 修复版 (触边面积占优 + 高贴边覆盖守卫)。
+        // 填充域贴满画幅边界被守卫剔除; 靶板/背景/class1 在填充内侧均为
+        // 独立内部域, 面积最大者 (靶板) 胜出。
+        cleaned = keepLargestRegion(bin_rotated);
+        snap("6.rot-largest", cleaned);
+        cleaned = fillHoles(cleaned);
+        cleaned = smoothBoundary(cleaned);
+        snap("7.rot-cleaned", cleaned);
+        did_rotate = true;
+        if (debug_capture_) last_upright_binary_ = cleaned.clone();
+    } else {
+        cleaned = smoothed;
+        snap("5.no-rot", cleaned);
+        if (debug_capture_) last_upright_binary_ = cleaned.clone();
+    }
+    if (debug_capture_) last_contour_binary_ = cleaned.clone();
+
+    // ---- 第5步: 提取最大轮廓 ----
+    std::vector<cv::Point> contour = extractLargestContour(cleaned);
+    if (contour.empty()) {
+        logStep("Result", "Contour extraction failed");
+        return Status::InsufficientFeatures;
+    }
+    last_contour_ = contour;
+
+    // ---- 第6步: approxPolyDP 二分搜索 → 角点 ----
+    std::vector<cv::Point2f> corners;
+    try {
+        corners = extractCornersFromContour(contour, cleaned.size());
+    } catch (const std::exception& e) {
+        logStep("Result", std::string("Corner extraction failed: ") + e.what());
+        return Status::InsufficientFeatures;
+    }
+
+    // ---- 第6.5步: 逆旋转角点回原始图像 ----
+    if (did_rotate) {
+        double rad = rot_angle * CV_PI / 180.0;
+        double cos_a = std::cos(rad);
+        double sin_a = std::sin(rad);
+        for (auto& pt : corners) {
+            float dx = pt.x - center_rot.x;
+            float dy = pt.y - center_rot.y;
+            float rx = static_cast<float>(dx * cos_a + dy * sin_a);
+            float ry = static_cast<float>(-dx * sin_a + dy * cos_a);
+            pt.x = rx + center_orig.x;
+            pt.y = ry + center_orig.y;
+        }
+    }
+
+    // Identity evidence must be the SAME selected component as the corners.
+    // The pre-rotation cleanup can select outer board/background in a padded
+    // class1 ROI, while the final cleanup correctly selects the inner mark.
+    // Rasterize the dense final contour (not the sparse fitted polygon) back
+    // in original ROI coordinates, preserving independent edge evidence.
+    if(mono_context_ && config_.mono_identity.enabled && (!use_class1_ || config_.mono_identity.class1_enabled)) {
+        std::vector<cv::Point> original_contour;original_contour.reserve(contour.size());
+        const double rad=rot_angle*CV_PI/180.,cos_a=std::cos(rad),sin_a=std::sin(rad);
+        for(const auto& p:contour) {
+            double x=p.x,y=p.y;
+            if(did_rotate) {
+                const double dx=x-center_rot.x,dy=y-center_rot.y;
+                x=dx*cos_a+dy*sin_a+center_orig.x;
+                y=-dx*sin_a+dy*cos_a+center_orig.y;
+            }
+            original_contour.emplace_back(cvRound(x),cvRound(y));
+        }
+        mono_identity_mask_=cv::Mat::zeros(work_img.size(),CV_8U);
+        cv::drawContours(mono_identity_mask_,std::vector<std::vector<cv::Point>>{original_contour},
+                         0,cv::Scalar(255),cv::FILLED);
+    }
+
+    // ---- 第7步: 按模板几何重排角点顺序 ----
+    last_corners_before_reorder_ = corners;
+    if (last_matched_template_ != nullptr) {
+        int tw = last_matched_template_->image.cols;
+        int th = last_matched_template_->image.rows;
+
+        // 将模板角点缩放到平滑后的图像空间 (work_img 与 smoothed 同尺寸,
+        // preset 路径下 smoothed 为空, 统一用 work_img)
+        double scale_x = static_cast<double>(work_img.cols) / tw;
+        double scale_y = static_cast<double>(work_img.rows) / th;
+
+        std::vector<cv::Point2f> scaled_template = last_matched_template_->corners;
+        for (auto& pt : scaled_template) {
+            pt.x *= static_cast<float>(scale_x);
+            pt.y *= static_cast<float>(scale_y);
+        }
+
+        auto matches = matchCorners(scaled_template, corners,
+                                     static_cast<double>(last_matched_template_->angle) + CPSAGL,
+                                     work_img.size());
+
+        if (!matches.empty()) {
+            std::vector<cv::Point2f> ordered(corners.size());
+            for (const auto& [tmpl_idx, bin_idx] : matches) {
+                if (static_cast<size_t>(bin_idx) < corners.size() &&
+                    static_cast<size_t>(tmpl_idx) < corners.size()) {
+                    ordered[tmpl_idx] = corners[bin_idx];
+                }
+            }
+            corners = std::move(ordered);
+        }
+    }
+
+    out_corners = std::move(corners);
+    logStep("Result", "Extracted " + std::to_string(out_corners.size()) + " corners");
+    return Status::Success;
+}
+
+// ============================================================================
+// 第1步: 保留最大连通域
+// ============================================================================
+
+cv::Mat BinaryCornerExtractor::keepLargestRegion(const cv::Mat& binary_img) {
+    cv::Mat labels, stats, centroids;
+    int num_labels = cv::connectedComponentsWithStats(binary_img, labels, stats, centroids, 8);
+
+    if (num_labels <= 1) {
+        logStep("LargestRegion", "No white regions found");
+        return binary_img.clone();
+    }
+
+    const int img_w = binary_img.cols;
+    const int img_h = binary_img.rows;
+
+    // 判断连通域是否接触图像四条边（ROI 边界处为背景，真实目标位于 ROI 内部）
+    auto touchesBorder = [&](int i) {
+        int left = stats.at<int>(i, cv::CC_STAT_LEFT);
+        int top  = stats.at<int>(i, cv::CC_STAT_TOP);
+        int w    = stats.at<int>(i, cv::CC_STAT_WIDTH);
+        int h    = stats.at<int>(i, cv::CC_STAT_HEIGHT);
+        return left <= 0 || top <= 0 || left + w >= img_w || top + h >= img_h;
+    };
+
+    // 第1步: 遍历所有白色连通域（跳过背景标签0），分别记录最大内部区域与最大触边区域
+    int best_label = -1;    // 最大内部(不触边)区域
+    int best_area = 0;
+    int touch_label = -1;   // 最大触边区域
+    int touch_area = 0;
+    int n_interior = 0;
+    for (int i = 1; i < num_labels; ++i) {
+        int area = stats.at<int>(i, cv::CC_STAT_AREA);
+        if (touchesBorder(i)) {
+            if (area > touch_area) {
+                touch_area = area;
+                touch_label = i;
+            }
+            continue;
+        }
+        ++n_interior;
+        if (area > best_area) {
+            best_area = area;
+            best_label = i;
+        }
+    }
+
+    // 贴边覆盖率: 区域在画幅四条边界上的像素占比。真目标紧框下仅在外扩画幅的
+    // 极值点少量贴边 (个位数像素); 背景/填充沿整条边界延伸 (占比高)。
+    auto borderCoverage = [&](int label) {
+        long cnt = 0;
+        for (int x = 0; x < img_w; ++x) {
+            if (labels.at<int>(0, x) == label) ++cnt;
+            if (labels.at<int>(img_h - 1, x) == label) ++cnt;
+        }
+        for (int y = 0; y < img_h; ++y) {
+            if (labels.at<int>(y, 0) == label) ++cnt;
+            if (labels.at<int>(y, img_w - 1) == label) ++cnt;
+        }
+        const long total = 2L * (img_w + img_h) - 4;
+        return total > 0 ? static_cast<double>(cnt) / static_cast<double>(total) : 0.0;
+    };
+
+    // 面积占优规则: touchesBorder 按 bbox 判定, YOLO 紧框下目标本体 bbox 顶到
+    // ROI 边界即被判"触边"而遭排除, 最大内部区域变成中心小图案 (class1 与靶板
+    // 同形, IoU 匹配自洽通过 → BC 误锁 class1)。触边区域面积占优 (≥ N 倍最大
+    // 内部区域) 且贴边覆盖率低 (非背景) 时选触边区域 —— 目标本体远大于内部
+    // 图案 (实测 ~200×); 高贴边覆盖 (≥5%) 的触边域是背景/填充, 不参与翻案。
+    constexpr int kTouchDominanceRatio = 4;
+    constexpr double kBgBorderCover = 0.05;
+    if (best_label >= 0 && touch_label >= 0 &&
+        touch_area >= kTouchDominanceRatio * best_area &&
+        borderCoverage(touch_label) < kBgBorderCover) {
+        logStep("LargestRegion",
+                "Touching region dominates by area (" + std::to_string(touch_area) +
+                " vs interior " + std::to_string(best_area) + "), selected touching");
+        best_label = touch_label;
+        best_area = touch_area;
+    }
+
+    // 回退：所有白色区域都接触边界时，退回原逻辑取全局最大面积
+    if (best_label < 0) {
+        best_label = 1;
+        best_area = stats.at<int>(1, cv::CC_STAT_AREA);
+        for (int i = 2; i < num_labels; ++i) {
+            int area = stats.at<int>(i, cv::CC_STAT_AREA);
+            if (area > best_area) {
+                best_area = area;
+                best_label = i;
+            }
+        }
+        logStep("LargestRegion",
+                "All regions touch border, fallback to global largest");
+    }
+
+    // compare(CMP_EQ) 单趟直出 0/255 掩码, 输出与 zeros+setTo(255, labels==best)
+    // 逐位相同, 省 zeros 初始化 + (labels==best) 临时掩码两次全图分配/扫描
+    cv::Mat result;
+    cv::compare(labels, best_label, result, cv::CMP_EQ);
+
+    logStep("LargestRegion",
+            "Kept 1 region / " + std::to_string(num_labels - 1) +
+            " (interior=" + std::to_string(n_interior) +
+            "), area=" + std::to_string(best_area));
+    return result;
+}
+
+// ============================================================================
+// 第2步: 填充孔洞
+// ============================================================================
+
+cv::Mat BinaryCornerExtractor::fillHoles(const cv::Mat& binary_img) {
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(binary_img, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    cv::Mat filled = cv::Mat::zeros(binary_img.size(), CV_8UC1);
+    cv::drawContours(filled, contours, -1, cv::Scalar(255), cv::FILLED);
+
+    logStep("FillHoles",
+            "Filled " + std::to_string(contours.size()) + " external contours");
+    return filled;
+}
+
+// ============================================================================
+// 第3步: 形态学平滑
+// ============================================================================
+
+cv::Mat BinaryCornerExtractor::smoothBoundary(const cv::Mat& binary_img) {
+    cv::Mat closed, opened;
+    cv::morphologyEx(binary_img, closed, cv::MORPH_CLOSE, kernel_);
+    cv::morphologyEx(closed, opened, cv::MORPH_OPEN, kernel_);
+
+    logStep("SmoothBoundary", "Kernel: " + std::to_string(config_.kernel_size));
+    return opened;
+}
+
+// ============================================================================
+// 第5步: 提取最大轮廓
+// ============================================================================
+
+std::vector<cv::Point> BinaryCornerExtractor::extractLargestContour(
+    const cv::Mat& binary_img) {
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(binary_img, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    if (contours.empty()) {
+        logStep("LargestContour", "No contours found");
+        return {};
+    }
+
+    auto largest = std::max_element(contours.begin(), contours.end(),
+        [](const auto& a, const auto& b) {
+            return cv::contourArea(a) < cv::contourArea(b);
+        });
+
+    double area = cv::contourArea(*largest);
+    logStep("LargestContour",
+            "Area: " + std::to_string(static_cast<int>(area)) +
+            ", points: " + std::to_string(largest->size()));
+    return *largest;
+}
+
+// ============================================================================
+// 第6步: 从轮廓提取角点 (approxPolyDP 二分搜索)
+// ============================================================================
+
+std::vector<cv::Point2f> BinaryCornerExtractor::extractCornersFromContour(
+    const std::vector<cv::Point>& contour, const cv::Size& /*img_size*/) {
+
+    std::vector<cv::Point2f> work_contour;
+    work_contour.reserve(contour.size());
+
+    // 可选地对轮廓进行缩放，以便在小图像上获得亚像素精度
+    if (std::abs(config_.scale - 1.0) > 1e-6) {
+        float s = static_cast<float>(config_.scale);
+        for (const auto& pt : contour) {
+            work_contour.emplace_back(pt.x * s, pt.y * s);
+        }
+    } else {
+        for (const auto& pt : contour) {
+            work_contour.emplace_back(static_cast<float>(pt.x),
+                                       static_cast<float>(pt.y));
+        }
+    }
+
+    double perimeter = cv::arcLength(work_contour, true);
+
+    // Epsilon 二分搜索: 较大的 epsilon → 较少的角点
+    double lo = 0.001, hi = 0.05;
+    std::vector<cv::Point2f> approx;
+    std::vector<cv::Point2f> best_approx;   // 跟踪最接近目标角点数的近似结果
+    int best_diff = std::numeric_limits<int>::max();
+    bool exact_hit = false;
+
+    for (int iter = 0; iter < 16; ++iter) {
+        double mid = (lo + hi) / 2.0;
+        cv::approxPolyDP(work_contour, approx, mid * perimeter, true);
+        int n = static_cast<int>(approx.size());
+        int diff = std::abs(n - config_.corners);
+
+        // 跟踪最佳近似
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_approx = approx;
+        }
+
+        if (n == config_.corners) {
+            exact_hit = true;
+            break;
+        } else if (n < config_.corners) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+
+    // 如果未精确命中，使用最接近的一次近似结果
+    if (!exact_hit && !best_approx.empty()) {
+        if (g_verbose_console)
+            std::cout << "[BinaryCorner] approxPolyDP binary search: no exact hit, "
+                      << "best=" << best_approx.size() << " corners (target="
+                      << config_.corners << ", diff=" << best_diff << ")" << std::endl;
+        approx = std::move(best_approx);
+    }
+
+    // ---- 精确 N 角点修复：n > N 删最平顶点；n < N 分裂最大偏差弦 ----
+    // 伪角点（圆弧中段/台阶残留）相邻边近共线、转向角最小；被圆化合并的
+    // 真角点所在弦对轮廓有最大偏差，垂距最远的轮廓点即角点顶点。
+    if (static_cast<int>(approx.size()) != config_.corners && approx.size() >= 3 &&
+        !work_contour.empty()) {
+        int removed = 0, inserted = 0;
+        for (int guard = 0;
+             guard < 2 * config_.corners &&
+             static_cast<int>(approx.size()) != config_.corners; ++guard) {
+            int n = static_cast<int>(approx.size());
+            if (n > config_.corners) {
+                int worst = -1;
+                double worst_turn = std::numeric_limits<double>::max();
+                for (int i = 0; i < n; ++i) {
+                    const auto& prev = approx[(i - 1 + n) % n];
+                    const auto& cur  = approx[i];
+                    const auto& next = approx[(i + 1) % n];
+                    double e1x = cur.x - prev.x, e1y = cur.y - prev.y;
+                    double e2x = next.x - cur.x, e2y = next.y - cur.y;
+                    double l1 = std::hypot(e1x, e1y), l2 = std::hypot(e2x, e2y);
+                    if (l1 < 1e-9 || l2 < 1e-9) continue;
+                    double cos_t = (e1x * e2x + e1y * e2y) / (l1 * l2);
+                    double turn = std::acos(std::clamp(cos_t, -1.0, 1.0));
+                    if (turn < worst_turn) { worst_turn = turn; worst = i; }
+                }
+                if (worst < 0 || n <= 3) break;
+                approx.erase(approx.begin() + worst);
+                ++removed;
+            } else {
+                // approx 顶点映射回 work_contour 索引（最近点），逐边扫开区间内
+                // 轮廓点到弦的垂距，全局最大者插入为新顶点
+                int m = static_cast<int>(work_contour.size());
+                std::vector<int> vidx(n);
+                for (int i = 0; i < n; ++i) {
+                    int best_j = -1;
+                    double best_d2 = std::numeric_limits<double>::max();
+                    for (int j = 0; j < m; ++j) {
+                        double dx = work_contour[j].x - approx[i].x;
+                        double dy = work_contour[j].y - approx[i].y;
+                        double d2 = dx * dx + dy * dy;
+                        if (d2 < best_d2) { best_d2 = d2; best_j = j; }
+                    }
+                    vidx[i] = best_j;
+                }
+                int split_v = -1, split_j = -1;
+                double max_dev = -1.0;
+                for (int i = 0; i < n; ++i) {
+                    int j0 = vidx[i], j1 = vidx[(i + 1) % n];
+                    const auto& a = approx[i];
+                    const auto& b = approx[(i + 1) % n];
+                    double ex = b.x - a.x, ey = b.y - a.y;
+                    double elen = std::hypot(ex, ey);
+                    if (elen < 1e-9) continue;
+                    int span = (j1 - j0 + m) % m;
+                    for (int s = 1; s < span; ++s) {
+                        int j = (j0 + s) % m;
+                        double px = work_contour[j].x - a.x;
+                        double py = work_contour[j].y - a.y;
+                        double dev = std::abs(px * ey - py * ex) / elen;
+                        if (dev > max_dev) { max_dev = dev; split_v = i; split_j = j; }
+                    }
+                }
+                if (split_v < 0) break;
+                approx.insert(approx.begin() + split_v + 1, work_contour[split_j]);
+                ++inserted;
+            }
+        }
+        if (removed || inserted) {
+            logStep("CornerRepair",
+                    std::to_string(removed) + " flattest removed, " +
+                    std::to_string(inserted) + " edges split -> " +
+                    std::to_string(approx.size()) + " corners");
+            if (g_verbose_console)
+                std::cout << "[BinaryCorner] corner repair: removed " << removed
+                          << " flattest, split " << inserted << " edges -> "
+                          << approx.size() << " corners (target "
+                          << config_.corners << ")" << std::endl;
+        }
+    }
+
+    if (approx.empty()) {
+        throw std::runtime_error("approxPolyDP returned empty");
+    }
+
+    // 缩放回原始坐标
+    if (std::abs(config_.scale - 1.0) > 1e-6) {
+        float inv_scale = 1.0f / static_cast<float>(config_.scale);
+        for (auto& pt : approx) {
+            pt.x *= inv_scale;
+            pt.y *= inv_scale;
+        }
+    }
+
+    logStep("ExtractCorners",
+            "Extracted " + std::to_string(approx.size()) + " corners (target " +
+            std::to_string(config_.corners) + ")");
+    return approx;
+}
+
+// ============================================================================
+// 模板匹配 —— IoU遍历24个模板找最佳角度
+// ============================================================================
+
+BinaryCornerExtractor::BestMatch BinaryCornerExtractor::findBestMatch(
+    const cv::Mat& binary_img) {
+
+    BestMatch best;
+    if (templates_.empty()) {
+        logStep("FindBestMatch", "No templates available");
+        return best;
+    }
+
+    auto [norm_binary, success] = extractAndNormalizeRoi(binary_img, 50);
+    if (!success) {
+        logStep("FindBestMatch", "ROI normalization failed");
+        return best;
+    }
+
+    for (size_t i = 0; i < templates_.size(); ++i) {
+        double overlap = calculateOverlap(norm_binary, templates_[i].image_bool);
+        if (overlap > best.overlap) {
+            best.overlap = overlap;
+            best.template_index = static_cast<int>(i);
+        }
+    }
+
+    logStep("FindBestMatch",
+            "Best: angle=" + std::to_string(templates_[best.template_index].angle) +
+            " deg, overlap=" + std::to_string(best.overlap));
+    return best;
+}
+
+// ============================================================================
+// 角点重排序 —— 极角对齐（零轴=正上方，CCW正向遍历）
+// ============================================================================
+
+std::vector<int> BinaryCornerExtractor::reorderByGeometry(
+    const std::vector<cv::Point2f>& corners,
+    const cv::Point2f& center,
+    double reference_angle_deg,
+    double ref_dist) {
+
+    int n = static_cast<int>(corners.size());
+    if (n == 0) return {};
+
+    // 将参考角度归一化到 [0, 2π): 零轴 = 正上方（图像y负方向），CCW = 正方向
+    double ref_deg = std::fmod(reference_angle_deg, 360.0);
+    if (ref_deg < 0.0) ref_deg += 360.0;
+    double ref_rad = ref_deg * CV_PI / 180.0;
+
+    // 找到极角最接近参考角度的角点（以及次近的角点，用于距离去歧义）
+    int best_idx = 0, second_idx = -1;
+    double best_diff = std::numeric_limits<double>::max();
+    double second_diff = std::numeric_limits<double>::max();
+    for (int i = 0; i < n; ++i) {
+        double dx = corners[i].x - center.x;
+        double dy = corners[i].y - center.y;
+        // atan2(-dx, -dy): 零轴 = 正上方，CCW = 正方向
+        double a = std::atan2(-dx, -dy);
+        if (a < 0.0) a += 2.0 * CV_PI;
+        double diff = std::abs(a - ref_rad);
+        if (diff > CV_PI) diff = 2.0 * CV_PI - diff;  // 角度环绕处理
+        if (diff < best_diff) {
+            second_diff = best_diff;
+            second_idx  = best_idx;
+            best_diff = diff;
+            best_idx = i;
+        } else if (diff < second_diff) {
+            second_diff = diff;
+            second_idx = i;
+        }
+    }
+
+    int start_idx = best_idx;
+
+    // 距离去歧义：当提供了 ref_dist 时，在两个角度最接近的候选点中选择距离更近的那个
+    if (ref_dist > 0.0 && second_idx >= 0) {
+        double d1 = std::hypot(corners[best_idx].x - center.x,
+                               corners[best_idx].y - center.y);
+        double d2 = std::hypot(corners[second_idx].x - center.x,
+                               corners[second_idx].y - center.y);
+        if (std::abs(d1 - ref_dist) > std::abs(d2 - ref_dist)) {
+            start_idx = second_idx;
+        }
+    }
+
+    // 轮廓为逆时针方向（cv::findContours 保证白色外轮廓为 CCW），始终正向遍历
+    std::vector<int> order(n);
+    for (int i = 0; i < n; ++i) {
+        order[i] = (start_idx + i) % n;
+    }
+    return order;
+}
+
+// ============================================================================
+// 角点匹配 —— matchCorners
+// ============================================================================
+
+std::vector<std::pair<int, int>> BinaryCornerExtractor::matchCorners(
+    const std::vector<cv::Point2f>& template_corners,
+    const std::vector<cv::Point2f>& binary_corners,
+    double template_angle,
+    const cv::Size& coord_size) {
+
+    int n_tmpl = static_cast<int>(template_corners.size());
+    int n_bin  = static_cast<int>(binary_corners.size());
+
+    if (n_tmpl == 0 || n_bin == 0) {
+        logStep("MatchCorners",
+                "Cannot match: template=" + std::to_string(n_tmpl) +
+                ", binary=" + std::to_string(n_bin));
+        return {};
+    }
+
+    // 两者在同一坐标空间，使用统一的图像中心
+    cv::Point2f img_center(coord_size.width / 2.0f, coord_size.height / 2.0f);
+
+    // 模板角点: 按角度约束排序
+    auto tmpl_order = reorderByGeometry(template_corners, img_center, template_angle);
+
+    // 二值角点: 相同的角度约束排序
+    auto bin_order = reorderByGeometry(binary_corners, img_center, template_angle);
+
+    int n_pairs = std::min(n_tmpl, n_bin);
+    std::vector<std::pair<int, int>> matches;
+    matches.reserve(n_pairs);
+    for (int k = 0; k < n_pairs; ++k) {
+        matches.emplace_back(tmpl_order[k], bin_order[k]);
+    }
+
+    logStep("MatchCorners", "Matched " + std::to_string(matches.size()) + " pairs");
+    return matches;
+}
+
+// ============================================================================
+// 静态可视化
+// ============================================================================
+
+cv::Mat BinaryCornerExtractor::drawCorners(const cv::Mat& img,
+                                            const std::vector<cv::Point2f>& corners) {
+    cv::Mat vis;
+    if (img.channels() == 1) {
+        cv::cvtColor(img, vis, cv::COLOR_GRAY2BGR);
+    } else {
+        vis = img.clone();
+    }
+
+    const cv::Scalar colors[] = {
+        {0, 0, 255},    // 红
+        {0, 255, 0},    // 绿
+        {0, 255, 255},  // 黄
+    };
+    const cv::Scalar default_color(255, 0, 0); // 蓝
+
+    for (size_t i = 0; i < corners.size(); ++i) {
+        cv::Scalar color = (i < 3) ? colors[i] : default_color;
+        cv::Point pt(static_cast<int>(std::round(corners[i].x)),
+                      static_cast<int>(std::round(corners[i].y)));
+        cv::circle(vis, pt, 0, color, -1);
+    }
+    return vis;
+}
+
+cv::Mat BinaryCornerExtractor::drawMatchedCorners(
+    const cv::Mat& input_img,
+    const std::vector<cv::Point2f>& input_corners,
+    const cv::Mat& template_img,
+    const std::vector<cv::Point2f>& template_corners,
+    double template_angle) {
+
+    int h1 = input_img.rows, w1 = input_img.cols;
+    int h2 = template_img.rows, w2 = template_img.cols;
+
+    cv::Mat left, right;
+    if (input_img.channels() == 1)
+        cv::cvtColor(input_img, left, cv::COLOR_GRAY2BGR);
+    else
+        left = input_img.clone();
+
+    if (template_img.channels() == 1)
+        cv::cvtColor(template_img, right, cv::COLOR_GRAY2BGR);
+    else
+        right = template_img.clone();
+
+    int h = std::max(h1, h2);
+    cv::Mat canvas(h, w1 + w2, CV_8UC3, cv::Scalar(0, 0, 0));
+    left.copyTo(canvas(cv::Rect(0, 0, w1, h1)));
+    right.copyTo(canvas(cv::Rect(w1, 0, w2, h2)));
+
+    const cv::Scalar colors[] = {
+        {0, 0, 255}, {0, 255, 0}, {0, 255, 255},
+        {255, 0, 0}, {255, 0, 255}, {255, 255, 0},
+        {128, 0, 255}, {0, 128, 255}, {255, 128, 0}, {128, 255, 0}
+    };
+    const int n_colors = sizeof(colors) / sizeof(colors[0]);
+
+    int n_pairs = std::min(static_cast<int>(input_corners.size()),
+                            static_cast<int>(template_corners.size()));
+
+    for (int i = 0; i < n_pairs; ++i) {
+        cv::Scalar color = colors[i % n_colors];
+        cv::Point ipt(static_cast<int>(std::round(input_corners[i].x)),
+                       static_cast<int>(std::round(input_corners[i].y)));
+        cv::Point tpt(static_cast<int>(std::round(template_corners[i].x)) + w1,
+                       static_cast<int>(std::round(template_corners[i].y)));
+
+        cv::circle(canvas, ipt, 0, color, -1);
+        cv::circle(canvas, tpt, 0, color, -1);
+    }
+
+    // 绘制中心 + 模板角度射线（两侧）
+    double a_rad = (template_angle * CV_PI / 180.0);
+
+    cv::Point left_center(w1 / 2, h1 / 2);
+    int left_r = std::min(w1, h1) / 3;
+    cv::Point left_end(left_center.x + static_cast<int>(-left_r * std::sin(a_rad)),
+                       left_center.y + static_cast<int>(-left_r * std::cos(a_rad)));
+    cv::circle(canvas, left_center, 1, cv::Scalar(0, 255, 255), -1);
+    cv::line(canvas, left_center, left_end, cv::Scalar(0, 255, 255), 1);
+
+    cv::Point right_center(w1 + w2 / 2, h2 / 2);
+    int right_r = std::min(w2, h2) / 3;
+    cv::Point right_end(right_center.x + static_cast<int>(-right_r * std::sin(a_rad)),
+                        right_center.y + static_cast<int>(-right_r * std::cos(a_rad)));
+    cv::circle(canvas, right_center, 1, cv::Scalar(0, 255, 255), -1);
+    cv::line(canvas, right_center, right_end, cv::Scalar(0, 255, 255), 1);
+
+    return canvas;
+}
+
+std::vector<cv::Mat> BinaryCornerExtractor::debugVisualizeReordering(
+    const cv::Mat& binary_img,
+    const cv::Mat& template_img,
+    const std::vector<cv::Point2f>& binary_corners,
+    const std::vector<cv::Point2f>& template_corners,
+    double template_angle,
+    const cv::Size& coord_size) {
+
+    const cv::Scalar RED(0, 0, 255), YLW(0, 255, 255), BLU(255, 0, 0), GRN(0, 255, 0);
+    const cv::Scalar WHT(255, 255, 255), YEL(0, 255, 255), CYAN(255, 255, 0);
+
+    cv::Point2f ctr(coord_size.width / 2.0f, coord_size.height / 2.0f);
+
+    // 仅按角度找首个角点（无距离去歧义）
+    auto findFirst = [&](const std::vector<cv::Point2f>& pts, double ref_deg) {
+        return reorderByGeometry(pts, ctr, ref_deg)[0];
+    };
+    int tmpl_first = findFirst(template_corners, template_angle);
+    int bin_first  = findFirst(binary_corners, template_angle);
+
+    auto toBgr = [&](const cv::Mat& img) -> cv::Mat {
+        cv::Mat out;
+        if (img.channels() == 1)
+            cv::cvtColor(img, out, cv::COLOR_GRAY2BGR);
+        else
+            out = img.clone();
+        return out;
+    };
+
+    auto drawCornerSet = [&](cv::Mat& img, const std::vector<cv::Point2f>& pts, int first_idx) {
+        const cv::Scalar colors[] = {RED, YLW, BLU};
+        for (size_t i = 0; i < pts.size(); ++i) {
+            cv::Scalar c = (i < 3) ? colors[i] : GRN;
+            cv::Point p(static_cast<int>(std::round(pts[i].x)),
+                        static_cast<int>(std::round(pts[i].y)));
+            cv::circle(img, p, 1, c, -1);
+            if (static_cast<int>(i) == first_idx)
+                cv::circle(img, p, 7, CYAN, 1);
+        }
+    };
+
+    auto drawPolarView = [&](cv::Mat& img, const std::vector<cv::Point2f>& pts, int first_idx) {
+        cv::Point pc(static_cast<int>(ctr.x), static_cast<int>(ctr.y));
+        double a_rad = template_angle * CV_PI / 180.0;
+        int r = std::min(coord_size.width, coord_size.height) / 2;
+
+        cv::Point z_end(pc.x, pc.y - r);
+        cv::line(img, pc, z_end, WHT, 1);
+
+        cv::Point t_end(pc.x + static_cast<int>(-r * std::sin(a_rad)),
+                        pc.y + static_cast<int>(-r * std::cos(a_rad)));
+        cv::line(img, pc, t_end, YEL, 1);
+
+        for (size_t i = 0; i < pts.size(); ++i) {
+            int px = static_cast<int>(std::round(pts[i].x));
+            int py = static_cast<int>(std::round(pts[i].y));
+            cv::Scalar clr = (static_cast<int>(i) == first_idx) ? CYAN : GRN;
+            cv::circle(img, cv::Point(px, py), 1, clr, -1);
+        }
+
+        cv::circle(img, pc, 3, YEL, -1);
+    };
+
+    cv::Mat bin_bgr = toBgr(binary_img);
+    cv::Mat tmpl_bgr = toBgr(template_img);
+    if (tmpl_bgr.size() != binary_img.size())
+        cv::resize(tmpl_bgr, tmpl_bgr, binary_img.size(), 0, 0, cv::INTER_NEAREST);
+
+    cv::Mat img0 = bin_bgr.clone();
+    drawCornerSet(img0, binary_corners, bin_first);
+
+    cv::Mat img1 = tmpl_bgr.clone();
+    drawCornerSet(img1, template_corners, tmpl_first);
+
+    cv::Mat img2 = bin_bgr.clone();
+    drawPolarView(img2, binary_corners, bin_first);
+
+    cv::Mat img3 = tmpl_bgr.clone();
+    drawPolarView(img3, template_corners, tmpl_first);
+
+    return {img0, img1, img2, img3};
+}
+
+// ============================================================================
+// 日志记录
+// ============================================================================
+
+void BinaryCornerExtractor::logStep(const std::string& step, const std::string& info) {
+    process_log_.emplace_back(step, info);
+}
+
+// ============================================================================
+// 单目特征提取 —— 仅左图 Otsu → 模板匹配 → approxPolyDP 角点
+// ============================================================================
+
+PipelineResult BinaryCornerExtractor::extractMonoOrdinary(const cv::Mat& gray,const cv::Mat& color) {
+    struct Guard {bool& flag;bool previous;~Guard(){flag=previous;}} guard{ordinary_recovery_context_,ordinary_recovery_context_};
+    ordinary_recovery_context_=true;
+    return extractMono(gray,color);
+}
+
+PipelineResult BinaryCornerExtractor::extractMonoDual(const cv::Mat& gray,const cv::Mat& color,
+        const NormalizedCornerRecoveryConfig& policy) {
+    if(!mono_context_ || !policy.enabled)return extractMono(gray,color);
+    auto validation=config_.mono_identity;validation.class0_recovery=policy;
+    validateMonoCornerIdentityConfig(validation);
+    if(use_class1_ && !validation.class1_enabled)
+        throw std::invalid_argument("DualROI recovery requires canonical class1 identity");
+    struct Guard {
+        const NormalizedCornerRecoveryConfig*& slot;
+        const NormalizedCornerRecoveryConfig* previous;
+        ~Guard(){slot=previous;}
+    } guard{dual_recovery_context_,dual_recovery_context_};
+    dual_recovery_context_=&policy;
+    auto result=extractMono(gray,color);
+    const auto& d=last_mono_identity_;
+    const bool repaired=std::any_of(d.recovery_observations.begin(),d.recovery_observations.end(),
+        [](const auto& o){return o.status=="repaired";});
+    for(const auto& o:d.recovery_observations) {
+        DualCornerRecoveryObservation record;record.class_id=use_class1_?1:0;
+        record.point=o;record.recovery_status=d.recovery_status;
+        result.dual_corner_observations.push_back(std::move(record));
+        if(repaired && o.status=="kept") {
+            result.bc_recovery_base_points.push_back(o.original);
+            result.bc_recovery_base_ids.push_back(o.id);
+        }
+    }
+    if(result.dual_corner_observations.empty()) {
+        DualCornerRecoveryObservation record;record.class_id=use_class1_?1:0;
+        record.recovery_status=d.status;record.point.status="not_observed";
+        result.dual_corner_observations.push_back(std::move(record));
+    }
+    return result;
+}
+
+PipelineResult BinaryCornerExtractor::extractMono(const cv::Mat& gray,
+                                                   const cv::Mat& color) {
+    PipelineResult result;
+    last_mono_identity_=MonoCornerIdentityResult{};
+    mono_identity_mask_.release();
+    result.left_color = color;
+
+    if (gray.empty()) {
+        std::cerr << "[BinaryCorner::extractMono] empty image" << std::endl;
+        return result;
+    }
+
+    auto t_extract_start = std::chrono::steady_clock::now();
+
+    // 二值化阶段快照: 每次调用覆盖; 单目 = 左相机
+    last_binary_process_.clear();
+    stage_prefix_ = "L|";
+
+    // Otsu 二值化
+    cv::Mat binary;
+    cv::threshold(gray, binary, 0, 255, cv::THRESH_BINARY + cv::THRESH_OTSU);
+    if (debug_capture_) last_left_binary_ = binary.clone();
+
+    // 从二值图像提取角点
+    std::vector<cv::Point2f> corners;
+    const bool identity_enabled=mono_context_ && config_.mono_identity.enabled &&
+        (!use_class1_ || config_.mono_identity.class1_enabled);
+    const auto& recovery_policy=dual_recovery_context_?*dual_recovery_context_:config_.mono_identity.class0_recovery;
+    const bool class0_recovery=identity_enabled && recovery_policy.enabled &&
+        (dual_recovery_context_ || (!use_class1_ && ordinary_recovery_context_));
+    const bool normalized_frontend=identity_enabled && config_.mono_identity.frontend=="normalized";
+    Status s=Status::Success;
+    if(normalized_frontend) {
+        process_log_.clear();last_matched_template_=nullptr;last_match_overlap_=0;
+        last_contour_.clear();last_contour_binary_.release();last_upright_binary_.release();
+        auto snap=[&](const char* key,const cv::Mat& image) {
+            if(debug_capture_) last_binary_process_.emplace_back(stage_prefix_+key,image.clone());
+        };
+        snap("1.otsu",binary);
+        auto start=std::chrono::steady_clock::now();
+        cv::Mat largest=keepLargestRegion(binary);snap("2.largest",largest);
+        cv::Mat filled=fillHoles(largest);snap("3.filled",filled);
+        mono_identity_mask_=smoothBoundary(filled);snap("4.smoothed",mono_identity_mask_);
+        result.timing["mono_cleanup"]=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        if(debug_capture_) {
+            last_largest_region_=largest.clone();last_contour_binary_=mono_identity_mask_.clone();
+            last_upright_binary_=mono_identity_mask_.clone();
+        }
+        last_mono_identity_=mono_identity_.extractNormalized(mono_identity_mask_,debug_capture_,gray,class0_recovery,dual_recovery_context_);
+        if(debug_capture_) last_contour_=last_mono_identity_.source_contour;
+        corners=last_mono_identity_.points;
+        last_corners_before_reorder_=last_mono_identity_.before_refinement;
+        // Canonical identity is already established. Do not report the old
+        // angle as a template orientation to Dual-ROI downstream consumers.
+        for(const auto& t:templates_) if(t.angle==0) {last_matched_template_=&t;break;}
+        last_match_overlap_=last_mono_identity_.iou;
+        result.timing["mono_normalize"]=last_mono_identity_.normalization_ms;
+        result.timing["mono_corners"]=last_mono_identity_.corners_ms;
+        result.timing["mono_refine"]=last_mono_identity_.refinement_ms;
+        result.timing["mono_validate"]=last_mono_identity_.validation_ms;
+    } else {
+        s=extractFromBinary(binary,corners);
+    }
+    if (!normalized_frontend && (s != Status::Success || corners.empty())) {
+        std::cerr << "[BinaryCorner::extractMono] extraction failed (status="
+                  << static_cast<int>(s) << ")" << std::endl;
+        return result;
+    }
+
+    if(identity_enabled) {
+        if(!normalized_frontend) last_mono_identity_=mono_identity_.match(corners,mono_identity_mask_,debug_capture_,gray,class0_recovery,dual_recovery_context_);
+        const auto& d=last_mono_identity_;
+        result.bc_detected_count = d.detected_count;
+        result.bc_rejected_points = d.rejected_points;
+        result.bc_rejected_ids = d.rejected_ids;
+        result.bc_rejected_count = (int)d.rejected_points.size();
+        result.bc_residuals_px = d.residuals_px;
+        if(class0_recovery && !dual_recovery_context_) {
+            result.class0_corner_observations=d.recovery_observations;
+            result.class0_corner_recovery_status=d.recovery_status.empty()?d.status:d.recovery_status;
+        }
+        if (config_.mono_identity.quality_filter ||
+            config_.mono_identity.partial_matching)
+          result.pose_min_inliers = config_.mono_identity.min_reliable_points;
+        if(class0_recovery) result.pose_min_inliers=recovery_policy.min_pose_inliers;
+        result.timing["mono_identity"]=d.elapsed_ms;
+        result.route_detail="MonoIdentity:"+d.status+":"+d.path;
+        logStep("MonoIdentity",d.status+" path="+d.path+" iou="+std::to_string(d.iou)+
+            " fit_px="+std::to_string(d.fit_error_px)+" gap="+std::to_string(d.score_gap));
+        if(!d.accepted) {
+            result.failure_reason="mono_identity_"+d.status;
+            result.timing["binary_corner"]=std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now()-t_extract_start).count();
+            return result;
+        }
+        if(!normalized_frontend) {
+          if(class0_recovery && !d.points.empty()) corners=d.points;
+          else {
+            std::vector<cv::Point2f> ordered; ordered.reserve(d.indices.size());
+            for(int index:d.indices) ordered.push_back(corners[index]);
+            corners=std::move(ordered);
+          }
+        }
+    } else if(mono_context_ && config_.mono_identity.enabled && use_class1_) {
+        last_mono_identity_.status="class1_disabled";
+    }
+
+    std::vector<int> recovery_ids;
+    const bool recovery_enabled=mono_context_ && use_class1_ && class1_recovery_allowed_ &&
+        config_.class1_corner_recovery.enabled && !identity_enabled;
+    if(recovery_enabled) {
+        const TemplateData* base=nullptr;
+        for(const auto& t:templates_) if(t.angle==0) {base=&t;break;}
+        if(!base) {result.failure_reason="class1_recovery_no_template"; return result;}
+        auto recovered=recoverClass1Corners(gray,corners,base->corners,config_.class1_corner_recovery);
+        result.class1_corner_recovery_status=recovered.status;
+        result.class1_corner_observations=std::move(recovered.observations);
+        result.bc_detected_count=(int)corners.size();
+        result.pose_min_inliers=config_.class1_corner_recovery.min_pose_inliers;
+        for(const auto& o:result.class1_corner_observations) if(o.status=="rejected") {
+            result.bc_rejected_points.push_back(o.original);
+            result.bc_rejected_ids.push_back(o.id);
+        }
+        result.bc_rejected_count=(int)result.bc_rejected_points.size();
+        if(!recovered.accepted) {
+            result.failure_reason="class1_recovery_"+recovered.status;
+            return result;
+        }
+        corners=std::move(recovered.points);
+        recovery_ids=std::move(recovered.ids);
+    }
+
+    // kp_left
+    result.kp_left.reserve(corners.size());
+    for (const auto& pt : corners) {
+        result.kp_left.emplace_back(pt, 1.0f);
+    }
+    result.n_kp_left = static_cast<int>(corners.size());
+
+    // pts_left_match = 提取到的角点
+    result.pts_left_match = corners;
+
+    // 模板匹配数据（使用 0° 模板）
+    const TemplateData* matched_tmpl = last_matched_template_;
+    const TemplateData* tmpl_0 = nullptr;
+    for (const auto& t : templates_) {
+        if (t.angle == 0) { tmpl_0 = &t; break; }
+    }
+    if (tmpl_0 == nullptr) tmpl_0 = matched_tmpl;
+
+    if (tmpl_0 != nullptr) {
+        double scale_x = static_cast<double>(gray.cols) / tmpl_0->image.cols;
+        double scale_y = static_cast<double>(gray.rows) / tmpl_0->image.rows;
+
+        result.pts_template_match.clear();
+        const int n_match =
+            std::min((int)corners.size(), (int)tmpl_0->corners.size());
+        for (int i = 0; i < n_match; ++i) {
+          int id = recovery_enabled ? recovery_ids[i] :
+                   (identity_enabled ? last_mono_identity_.template_ids[i] : i);
+          if (id < 0 || id >= (int)tmpl_0->corners.size())
+            continue;
+          const auto &point = tmpl_0->corners[id];
+          result.pts_template_match.emplace_back(point.x * scale_x,
+                                                 point.y * scale_y);
+          result.good_matches.emplace_back(i, id, 0.0f);
+        }
+        result.n_template_match = (int)result.good_matches.size();
+    }
+
+    result.n_matched = static_cast<int>(result.good_matches.size());
+    result.success = !corners.empty();
+    result.timing["binary_corner"] = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_extract_start).count();
+    return result;
+}
+
+} // namespace gpnp

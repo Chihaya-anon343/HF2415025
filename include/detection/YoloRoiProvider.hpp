@@ -1,0 +1,71 @@
+#pragma once
+
+/**
+ * @file YoloRoiProvider.hpp
+ * @brief 外观类：YOLO 检测 → 双目 ROI 对。
+ *
+ * 将 YoloDetector + RoiGenerator 封装在单一接口之后。
+ * main.cpp 仅依赖此头文件——无需了解 ONNX 推理或 ROI 生成的内部细节。
+ */
+
+#include "common/Types.hpp"
+#include "detection/IYoloBackend.hpp"
+#include "detection/RoiGenerator.hpp"
+
+#include <opencv2/core.hpp>
+
+#include <memory>
+#include <utility>
+
+namespace gpnp {
+
+struct LeftDetection {
+    RoiGroup group;
+    std::vector<Detection> detections;
+    cv::Size image_size;
+    Status status{Status::UnknownError};
+};
+
+class YoloRoiProvider {
+public:
+    YoloRoiProvider();
+    ~YoloRoiProvider();
+
+    YoloRoiProvider(const YoloRoiProvider&) = delete;
+    YoloRoiProvider& operator=(const YoloRoiProvider&) = delete;
+
+    /// 初始化检测器和 ROI 生成器。失败时返回 false。
+    bool initialize(const YoloConfig& yolo_cfg, const RoiGenerator::Config& roi_cfg);
+
+    /// 设置近距离回退配置
+    void setCloseRangeConfig(const RoiGenerator::CloseRangeConfig& cfg);
+
+    /// 若 YOLO 已准备好推理则返回 true。
+    bool isReady() const;
+
+    /// 对两张图像运行 YOLO，返回双目 RoiGroup 对。
+    /// 每个 RoiGroup 最多可包含 2 个 ROI（主=class 0，次=class 1）。
+    /// 若任一侧检测失败则返回 {invalid, invalid}。
+    std::pair<RoiGroup, RoiGroup> detect(const cv::Mat& left_img,
+                                          const cv::Mat& right_img);
+
+    /// 单目模式：仅对左图运行 YOLO，返回单个 RoiGroup。
+    /// 右图不做任何处理。
+    RoiGroup detectMono(const cv::Mat& left_img);
+    std::vector<RoiCandidate> detectMonoCandidates(const cv::Mat &left_img);
+
+    /// Left-only detection, retaining raw detections for legacy pairing if needed.
+    LeftDetection detectLeft(const cv::Mat& left_img);
+    std::pair<RoiGroup, RoiGroup> completeStereo(const LeftDetection& left,
+                                                const cv::Mat& right_img);
+    struct InferenceCounts { int left{0}; int right{0}; };
+    InferenceCounts inferenceCounts() const { return inference_counts_; }
+
+private:
+    /// 推理后端: *.onnx → YoloDetector (ONNX Runtime); *.rknn → RknnDetector (NPU)
+    std::unique_ptr<IYoloBackend> detector_;
+    std::unique_ptr<RoiGenerator> roi_gen_;
+    InferenceCounts inference_counts_;
+};
+
+} // namespace gpnp

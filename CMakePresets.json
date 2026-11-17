@@ -1,0 +1,49 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "onnx",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-onnx",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GPNP_WITH_RKNN": "OFF"
+      },
+      "vendor": {
+        "jetbrains.com/clion": {
+          "toolchain": "Docker"
+        }
+      }
+    },
+    {
+      "name": "rknn",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-rknn",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GPNP_WITH_RKNN": "ON"
+      },
+      "vendor": {
+        "jetbrains.com/clion": {
+          "toolchain": "Docker"
+        }
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "onnx",
+      "configurePreset": "onnx",
+      "targets": [
+        "GPNP"
+      ]
+    },
+    {
+      "name": "rknn",
+      "configurePreset": "rknn",
+      "targets": [
+        "GPNP"
+      ]
+    }
+  ]
+}

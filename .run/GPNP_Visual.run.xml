@@ -1,0 +1,10 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="GPNP_Visual" type="CMakeRunConfiguration" factoryName="Application" PROGRAM_PARAMS="config/mono_visual.json" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" WORKING_DIR="file://$PROJECT_DIR$" PASS_PARENT_ENVS_2="true" PROJECT_NAME="GPNP_Runtime" TARGET_NAME="GPNP" CONFIG_NAME="Release-Docker" RUN_TARGET_PROJECT_NAME="GPNP_Runtime" RUN_TARGET_NAME="GPNP">
+    <envs>
+      <env name="QT_QPA_PLATFORM" value="offscreen" />
+    </envs>
+    <method v="2">
+      <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+    </method>
+  </configuration>
+</component>

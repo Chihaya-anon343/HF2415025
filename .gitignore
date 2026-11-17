@@ -1,0 +1,14 @@
+/build-*/
+/results/
+__pycache__/
+/provenance/
+/MANIFEST.json
+/VERIFICATION.json
+/verify_bundle.py
+
+# Raw experiment inputs stay local; retain the target template resources.
+/data/*
+!/data/clean_target2.png
+!/data/NewMuBan(reordered)/
+/cmake-build-*/
+/.idea/
